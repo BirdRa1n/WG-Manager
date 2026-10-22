@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
-  Cable, Fingerprint, KeyRound, Network, Plus, Radar, RefreshCw, Server, Settings2, ShieldCheck, Trash2, Upload, Users, Wrench,
+  Cable, Fingerprint, KeyRound, Link2, Network, Plus, Radar, RefreshCw, Server, Settings2, ShieldCheck, Trash2, Upload, Users, Wrench,
 } from 'lucide-react'
 import { api, Peer, VPS } from '../api/client'
 import {
@@ -136,6 +136,22 @@ function VPSDrawer({ vps, onClose, onChange }: { vps: VPS; onClose: () => void; 
     if (!(await confirm({ title: 'Instalar WireGuard nesta VPS?', body: 'Instala wireguard-tools e cria um wg0 novo (10.10.0.1/24). Use apenas em VPS sem WireGuard — para uma VPS já configurada, use Detectar.', confirm: 'Instalar' }))) return
     run('install', () => api.installWGVPS(vps.id), () => toast('info', 'Instalação iniciada', 'Acompanhe o progresso em Atividade.'))
   }
+  const connect = async () => {
+    if (!(await confirm({
+      title: `Conectar ${vps.name} ao host Proxmox?`, confirm: 'Criar túnel',
+      body: <>
+        O painel vai criar uma interface WireGuard nova no host (ex.: <code>wg1</code>) ligada a esta VPS, adicionar o host como peer
+        no <code>{vps.wg_interface}</code> da VPS e liberar <code>UDP {vps.wg_listen_port}</code> no iptables dela.
+        Se a sub-rede da VPS colidir com outra rede do host e ela não tiver peers, ela recebe uma sub-rede própria.
+        Túneis existentes não são alterados e há backup de todos os arquivos.
+      </>,
+    }))) return
+    run('connect', () => api.connectHost(vps.id), r => {
+      if (r.reused) toast('success', 'Túnel existente encontrado', `Gateway ${r.gateway.ip} via ${r.gateway.iface}`)
+      else if (r.handshake) toast('success', 'Túnel com o host ativo', `Gateway ${r.gateway.ip} via ${r.gateway.iface}${r.readdressed ? ` · VPS agora em ${r.vps_address}` : ''}`)
+      else toast('warn', `Túnel ${r.gateway.iface} criado, mas sem handshake`, `Libere UDP ${r.port} no firewall do provedor (Security List da Oracle) — o túnel fecha sozinho depois.`)
+    })
+  }
   const del = async () => {
     if (!(await confirm({ title: `Excluir ${vps.name}?`, danger: true, confirm: 'Excluir', body: 'Remove a VPS e a chave SSH do painel. Nada é alterado no servidor. Encaminhamentos ativos impedem a exclusão.' }))) return
     run('delete', () => api.deleteVPS(vps.id), () => { toast('success', 'VPS removida'); onClose() })
@@ -156,7 +172,13 @@ function VPSDrawer({ vps, onClose, onChange }: { vps: VPS; onClose: () => void; 
         </div>
         {vps.last_error && <Callout tone="danger" title="Último erro de conexão">{vps.last_error}</Callout>}
         {!vps.gw_ip && vps.wg_public_key && (
-          <Callout tone="warn" title="Gateway não configurado">Sem o IP do host Proxmox no túnel, só é possível encaminhar direto para peers. Clique em <b>Detectar</b> ou preencha em Configuração.</Callout>
+          <Callout tone="warn" title="Gateway não configurado">
+            O host Proxmox ainda não tem túnel com esta VPS, então só é possível encaminhar direto para peers.
+            <div className="row" style={{ marginTop: 10, flexWrap: 'wrap' }}>
+              <Button size="sm" variant="primary" icon={<Link2 size={14} />} loading={busy === 'connect'} onClick={connect}>Conectar ao host</Button>
+              <span className="muted" style={{ fontSize: 12 }}>Já existe um túnel? Use <b>Detectar</b> ou preencha em Configuração.</span>
+            </div>
+          </Callout>
         )}
         <div className="card card-pad" style={{ boxShadow: 'none' }}>
           <dl className="kv">

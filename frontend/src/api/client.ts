@@ -115,6 +115,7 @@ export const api = {
   testVPS: (id: number) => req<{ ok: boolean; root?: boolean; error?: string; host_key?: string }>('POST', `/vps/${id}/test`),
   detectVPS: (id: number) => req<any>('POST', `/vps/${id}/detect`),
   installWGVPS: (id: number) => req<any>('POST', `/vps/${id}/install-wireguard`),
+  connectHost: (id: number) => req<{ ok: boolean; reused?: boolean; handshake?: boolean; gateway: { ip: string; iface: string }; vps_address?: string; readdressed?: boolean; port?: number }>('POST', `/vps/${id}/connect-host`),
   resetHostKey: (id: number) => req<VPS>('POST', `/vps/${id}/reset-host-key`),
   peers: (id: number) => req<Peer[]>('GET', `/vps/${id}/peers`),
   removePeer: (id: number, pubkey: string) => req<any>('POST', `/vps/${id}/peers/remove`, { pubkey }),
