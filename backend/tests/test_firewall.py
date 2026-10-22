@@ -107,3 +107,19 @@ def test_connect_scripts_render():
     assert "Endpoint = 163.176.88.170:51820" in c and "Address = 10.20.0.2/24" in c
     inst = wg.VPS_WG_SETUP.format(iface="wg0", privkey="x", address="10.30.0.1/24", port=51820)
     assert "-I INPUT 1 -p udp --dport 51820 -j ACCEPT" in inst
+
+
+def test_caddyfile_generation():
+    import caddy
+    specs = [caddy.SiteSpec("b.example.com", "http", "192.168.1.5", 80),
+             caddy.SiteSpec("a.example.com", "https", "192.168.1.6", 8443),
+             caddy.SiteSpec("plain.example.com", "http", "192.168.1.7", 8080, tls=False),
+             caddy.SiteSpec("off.example.com", "http", "192.168.1.8", 80, enabled=False)]
+    cfg = caddy.caddyfile(specs, "me@example.com")
+    assert "email me@example.com" in cfg
+    assert cfg.index("a.example.com {") < cfg.index("b.example.com {")      # stable order
+    assert "reverse_proxy https://192.168.1.6:8443 {" in cfg and "tls_insecure_skip_verify" in cfg
+    assert "http://plain.example.com {" in cfg
+    assert "off.example.com" not in cfg
+    assert ":80 {" in caddy.caddyfile([], None)                               # placeholder when empty
+    assert "{config}" not in caddy.APPLY.format(config=cfg)

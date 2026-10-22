@@ -127,6 +127,36 @@ class APICredential(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ReverseProxy(Base):
+    """The single Caddy instance that serves every Site (lives in an LXC, reached via 80/443 forwards)."""
+    __tablename__ = "reverse_proxy"
+    id = Column(Integer, primary_key=True)
+    lxc_id = Column(Integer, ForeignKey("lxc.id"), nullable=False)
+    vps_id = Column(Integer, ForeignKey("vps.id"), nullable=False)
+    proxy_ip = Column(String, nullable=False)          # container IP on the LAN
+    acme_email = Column(String)
+    status = Column(String, default="pending")         # pending | installing | ready | error
+    created_at = Column(DateTime, default=datetime.utcnow)
+    lxc = relationship("LXC")
+    vps = relationship("VPS")
+
+
+class Site(Base):
+    """hostname → upstream, served by the reverse proxy (one public 80/443 for many services)."""
+    __tablename__ = "sites"
+    id = Column(Integer, primary_key=True)
+    hostname = Column(String, nullable=False, unique=True)
+    upstream_scheme = Column(String, default="http")   # http | https
+    upstream_ip = Column(String, nullable=False)
+    upstream_port = Column(Integer, nullable=False)
+    vmid = Column(Integer, nullable=True)
+    tls = Column(Boolean, default=True)                 # automatic HTTPS (Let's Encrypt)
+    enabled = Column(Boolean, default=True)
+    description = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Log(Base):
     __tablename__ = "logs"
     id = Column(Integer, primary_key=True)

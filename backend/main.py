@@ -15,7 +15,7 @@ import config
 import logger as log
 from auth import authenticate_proxmox, clear_session_cookie, create_token, get_current_user, set_session_cookie
 from database import init_db
-from routers import credentials, events, forwards, lxc, stats, system, tunnels, vps
+from routers import credentials, events, forwards, lxc, sites, stats, system, tunnels, vps
 
 VERSION_FILE = os.path.join(config.BASE_DIR, "version.json")
 STATIC_DIR = os.path.join(config.BASE_DIR, "frontend", "dist")
@@ -49,7 +49,7 @@ async def security(request: Request, call_next):
     return response
 
 
-for r in (vps, lxc, forwards, tunnels, events, credentials, stats, system):
+for r in (vps, lxc, forwards, sites, tunnels, events, credentials, stats, system):
     app.include_router(r.router)
 
 
