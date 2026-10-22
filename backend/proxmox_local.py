@@ -29,10 +29,12 @@ def run_script(script: str, timeout: int = 120) -> tuple[int, str]:
     return r.returncode, (r.stdout + r.stderr)
 
 
-def _pvesh(path: str, timeout: int = 15):
+def _pvesh(path: str, timeout: int = 15, **params):
     if not available():
         raise HostError("pvesh não encontrado — o painel precisa rodar no host Proxmox")
-    r = subprocess.run(["pvesh", "get", path, "--output-format", "json"],
+    # pvesh takes API parameters as --name value, never as a query string
+    args = [a for k, v in params.items() for a in (f"--{k}", str(v))]
+    r = subprocess.run(["pvesh", "get", path, *args, "--output-format", "json"],
                        capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise HostError(r.stderr.strip() or f"pvesh get {path} falhou")
@@ -80,7 +82,7 @@ def list_guests(force: bool = False) -> list[dict]:
     ts, cached = _guest_cache
     if not force and cached and time.time() - ts < 30:
         return cached
-    resources = _pvesh("/cluster/resources?type=vm") or []
+    resources = _pvesh("/cluster/resources", type="vm") or []
     guests = [r for r in resources if not r.get("template")]
     with ThreadPoolExecutor(max_workers=8) as pool:
         ip_lists = list(pool.map(_guest_ips, guests))
