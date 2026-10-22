@@ -38,6 +38,22 @@ def find_free_wg_address(used: list[str], server_address: str | None) -> str:
     raise ValueError(f"Sem endereços livres em {network}")
 
 
+def pick_subnet(taken: list[str]) -> str:
+    """First 10.N.0.0/24 (N = 10, 20, … 250, then the rest) that overlaps nothing in `taken`."""
+    nets = []
+    for t in taken:
+        try:
+            nets.append(ipaddress.ip_network(t, strict=False))
+        except ValueError:
+            continue
+    order = list(range(10, 251, 10)) + [n for n in range(11, 255) if n % 10]
+    for n in order:
+        cand = ipaddress.ip_network(f"10.{n}.0.0/24")
+        if not any(cand.overlaps(x) for x in nets if x.version == 4 and x.prefixlen > 0):
+            return str(cand)
+    raise ValueError("Nenhuma sub-rede 10.N.0.0/24 livre")
+
+
 VPS_WG_SETUP = """set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -56,6 +72,8 @@ ListenPort = {port}
 WGEOF
 systemctl enable wg-quick@{iface}
 systemctl restart wg-quick@{iface}
+iptables -C INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport {port} -j ACCEPT
+[ -d /etc/iptables ] && iptables-save > /etc/iptables/rules.v4
 echo "WG_SETUP_OK"
 """
 
@@ -91,6 +109,46 @@ if ! grep -q '{pubkey}' /etc/wireguard/{iface}.conf; then
   printf '\\n[Peer]\\n# {label}\\nPublicKey = {pubkey}\\nAllowedIPs = {allowed_ip}\\nPersistentKeepalive = 25\\n' >> /etc/wireguard/{iface}.conf
 fi
 echo "PEER_ADDED"
+"""
+
+# Joins the Proxmox host to the VPS tunnel: optional re-address (only when the VPS has no peers),
+# host peer, WireGuard port opened in INPUT and rules persisted. A backup of every file is kept.
+VPS_CONNECT_HOST = """set -e
+CONF=/etc/wireguard/{iface}.conf
+TS=$(date +%s)
+cp -p "$CONF" "$CONF.wgm-bak-$TS"
+[ -f /etc/iptables/rules.v4 ] && cp -p /etc/iptables/rules.v4 /etc/iptables/rules.v4.wgm-bak-$TS
+RESTART=0
+if [ "{new_address}" != "" ]; then
+  if [ "$(wg show {iface} peers | wc -l)" != "0" ]; then echo "HAS_PEERS"; exit 5; fi
+  sed -i 's#^Address *=.*#Address = {new_address}#' "$CONF"
+  RESTART=1
+fi
+OWNER=$(wg show {iface} allowed-ips | awk -v ip="{host_ip}/32" '{{for(i=2;i<=NF;i++) if($i==ip) print $1}}')
+if [ -n "$OWNER" ] && [ "$OWNER" != "{host_pub}" ]; then echo "IP_CONFLICT $OWNER"; exit 4; fi
+if ! grep -q '{host_pub}' "$CONF"; then
+  printf '\n[Peer]\n# Host Proxmox (WG Manager)\nPublicKey = {host_pub}\nAllowedIPs = {host_ip}/32\n' >> "$CONF"
+fi
+iptables -C INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport {port} -j ACCEPT
+[ -d /etc/iptables ] && iptables-save > /etc/iptables/rules.v4
+if [ "$RESTART" = "1" ]; then
+  systemctl restart wg-quick@{iface}
+else
+  wg set {iface} peer {host_pub} allowed-ips {host_ip}/32
+fi
+echo "HOST_CONNECTED"
+"""
+
+HOST_WG_CONF = """# Túnel com {vps_name} ({vps_host}) — criado pelo WG Manager
+[Interface]
+PrivateKey = {privkey}
+Address = {host_ip}/{prefix}
+
+[Peer]
+PublicKey = {vps_pub}
+Endpoint = {vps_host}:{vps_port}
+AllowedIPs = {network}
+PersistentKeepalive = 25
 """
 
 # Removes the peer at runtime and its [Peer] block from the config (a backup is kept).

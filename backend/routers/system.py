@@ -41,7 +41,7 @@ def overview(db: Session = Depends(get_db)):
             alerts.append({"level": "error", "title": f"{v.name} inacessível", "detail": h.get("error"), "link": "/servers"})
         if v.wg_public_key and not v.gw_ip:
             alerts.append({"level": "warn", "title": f"{v.name} sem gateway configurado",
-                           "detail": "Defina o IP do host Proxmox no túnel para usar encaminhamentos via host.", "link": "/servers"})
+                           "detail": "Abra a VPS em Servidores e use Conectar ao host para criar o túnel.", "link": "/servers"})
         if handshake_age and handshake_age > 180:
             alerts.append({"level": "error", "title": f"Túnel {v.name} ⇄ host parado",
                            "detail": f"Último handshake há {int(handshake_age // 60)} min.", "link": "/servers"})

@@ -1,6 +1,7 @@
 """Operations on the Proxmox host itself. The panel runs as root on the host, so it uses the local
 CLIs (pvesh / pct / iptables / wg) instead of juggling short-lived Proxmox API tickets."""
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -186,3 +187,61 @@ def default_lan_iface() -> str:
     except Exception:
         pass
     return "vmbr0"
+
+
+def local_networks() -> list[str]:
+    """Every IPv4 network routed on this host (LAN, Docker, Tailscale, existing tunnels)."""
+    try:
+        r = subprocess.run(["ip", "-4", "-o", "route", "show", "table", "all"], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        tok = line.split()[0] if line.split() else ""
+        if tok in ("broadcast", "local", "unreachable", "blackhole", "prohibit", "multicast"):
+            tok = line.split()[1] if len(line.split()) > 1 else ""
+        if tok and tok != "default" and tok[0].isdigit():
+            out.append(tok if "/" in tok else f"{tok}/32")
+    return out
+
+
+def next_wg_iface() -> str:
+    existing = {i["name"] for i in local_wg_interfaces()}
+    for n in range(0, 64):
+        name = f"wg{n}"
+        if name not in existing and not os.path.exists(f"/etc/wireguard/{name}.conf") \
+                and not os.path.exists(f"/sys/class/net/{name}"):
+            return name
+    raise HostError("Nenhum nome wgN livre")
+
+
+def create_host_tunnel(iface: str, conf: str):
+    path = f"/etc/wireguard/{iface}.conf"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(conf)
+    r = subprocess.run(["systemctl", "enable", "--now", f"wg-quick@{iface}"], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        remove_host_tunnel(iface)
+        raise HostError((r.stderr or r.stdout).strip() or f"wg-quick@{iface} falhou")
+
+
+def remove_host_tunnel(iface: str):
+    """Undo create_host_tunnel (the config is kept as a backup, never deleted)."""
+    subprocess.run(["systemctl", "disable", "--now", f"wg-quick@{iface}"], capture_output=True, timeout=30)
+    path = f"/etc/wireguard/{iface}.conf"
+    if os.path.exists(path):
+        os.replace(path, f"{path}.wgm-removed-{int(time.time())}")
+
+
+def wait_handshake(iface: str, timeout: int = 15) -> int:
+    """Seconds-since-epoch of the first handshake on `iface`, or 0 if none within `timeout`."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = subprocess.run(["wg", "show", iface, "latest-handshakes"], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0:
+                return int(parts[1])
+        time.sleep(1)
+    return 0

@@ -1,5 +1,7 @@
 import asyncio
 import os
+import shutil
+import subprocess
 import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -190,9 +192,10 @@ async def install_wireguard(vps_id: int, db: Session = Depends(get_db)):
     if v.wg_public_key:
         raise HTTPException(409, "Esta VPS já tem WireGuard configurado. Use 'Detectar' para reimportar.")
     priv, pub = wg.generate_keypair()
-    address = "10.10.0.1/24"
+    network = wg.pick_subnet(_taken_networks(db, exclude_vps=v.id))
+    address = network.replace(".0/24", ".1/24")
     conn = VPSConn(v)
-    await log.emit("info", f"Instalando WireGuard em {v.name}…", "install-wg")
+    await log.emit("info", f"Instalando WireGuard em {v.name} ({address})…", "install-wg")
 
     def run():
         from database import SessionLocal
@@ -220,6 +223,98 @@ async def install_wireguard(vps_id: int, db: Session = Depends(get_db)):
 
     asyncio.get_running_loop().run_in_executor(None, run)
     return {"ok": True, "started": True}
+
+
+def _taken_networks(db: Session, exclude_vps: int | None = None) -> list[str]:
+    """Networks a new tunnel must not overlap: host routes + every other VPS tunnel."""
+    taken = host.local_networks()
+    for other in db.query(VPS).filter(VPS.wg_address.isnot(None)).all():
+        if other.id != exclude_vps:
+            taken.append(other.wg_address)
+    return taken
+
+
+@router.post("/{vps_id}/connect-host")
+async def connect_host(vps_id: int, db: Session = Depends(get_db)):
+    """Create a dedicated WireGuard interface on the Proxmox host peered with this VPS, so it can
+    be used as the gateway for "via host" forwards."""
+    import ipaddress
+    import forward_engine
+    v = _get(vps_id, db)
+    if not v.wg_public_key or not v.wg_address:
+        raise HTTPException(400, "Instale ou detecte o WireGuard da VPS primeiro")
+    if v.gw_ip:
+        raise HTTPException(409, f"Esta VPS já usa o gateway {v.gw_ip} via {v.gw_iface}")
+    ok, why = forward_engine.host_supported()
+    if not ok or not shutil.which("wg"):
+        raise HTTPException(503, why or "wireguard-tools não instalado no host")
+    existing = await _in_thread(host.detect_gateway, v.host, v.wg_public_key)
+    if existing:
+        v.gw_ip, v.gw_iface = existing["ip"], existing["iface"]
+        db.commit()
+        return {"ok": True, "reused": True, "gateway": existing}
+
+    conn = VPSConn(v)
+
+    def live_peers():
+        with open_ssh(conn, timeout=10) as ssh:
+            return wg.parse_dump(ssh.run(wg.VPS_PEERS.format(iface=conn.wg_interface), sudo=True)[1])
+    try:
+        peers = await _in_thread(live_peers)
+    except Exception as e:
+        raise HTTPException(502, f"SSH: {e}")
+
+    # Keep the VPS subnet unless it overlaps something on this host; re-address only an empty tunnel.
+    current = ipaddress.IPv4Interface(v.wg_address)
+    taken = _taken_networks(db, exclude_vps=v.id)
+    clash = any(current.network.overlaps(ipaddress.ip_network(t, strict=False)) for t in taken)
+    new_address = ""
+    if clash:
+        if peers:
+            raise HTTPException(409, f"A sub-rede {current.network} da VPS colide com outra rede deste host e a VPS já tem "
+                                     f"{len(peers)} peer(s). Mude a sub-rede da VPS manualmente.")
+        network = wg.pick_subnet(taken)
+        new_address = network.replace(".0/24", ".1/24")
+        current = ipaddress.IPv4Interface(new_address)
+    used = [p["allowed_ips"] or "" for p in peers]
+    host_cidr = wg.find_free_wg_address(used, str(current))
+    host_ip, prefix = host_cidr.split("/")
+    iface = host.next_wg_iface()
+    priv, pub = wg.generate_keypair()
+    await log.emit("info", f"{v.name}: criando {iface} no host ({host_cidr})" + (f", VPS → {new_address}" if new_address else ""), "connect-host")
+
+    def vps_side():
+        with open_ssh(conn) as ssh:
+            return ssh.run(wg.VPS_CONNECT_HOST.format(iface=conn.wg_interface, new_address=new_address, host_ip=host_ip,
+                                                      host_pub=pub, port=conn.wg_listen_port), sudo=True)
+    code, out, err = await _in_thread(vps_side)
+    if "HOST_CONNECTED" not in out:
+        msg = "a VPS já tem peers" if "HAS_PEERS" in out else "IP em uso por outro peer" if "IP_CONFLICT" in out else (err or out).strip()[-200:]
+        await log.emit("error", f"{v.name}: falha na VPS — {msg}", "connect-host")
+        raise HTTPException(502, f"Falha ao configurar a VPS: {msg}")
+
+    conf = wg.HOST_WG_CONF.format(vps_name=val.text(v.name, 60), vps_host=v.host, privkey=priv, host_ip=host_ip,
+                                  prefix=prefix, vps_pub=v.wg_public_key, vps_port=conn.wg_listen_port,
+                                  network=str(current.network))
+    try:
+        await _in_thread(host.create_host_tunnel, iface, conf)
+    except Exception as e:
+        await log.emit("error", f"{iface}: {e}", "connect-host")
+        raise HTTPException(500, f"Falha ao subir {iface} no host: {e}")
+    subprocess.run(["ping", "-c", "1", "-W", "2", str(current.ip)], capture_output=True)
+    handshake = await _in_thread(host.wait_handshake, iface, 15)
+
+    v.wg_address = str(current)
+    v.gw_ip, v.gw_iface = host_ip, iface
+    v.lan_iface = v.lan_iface or host.default_lan_iface()
+    db.commit()
+    if handshake:
+        await log.emit("success", f"{v.name}: túnel {iface} ativo — gateway {host_ip}", "connect-host")
+    else:
+        await log.emit("warn", f"{v.name}: {iface} criado, mas sem handshake. Libere UDP {conn.wg_listen_port} "
+                               f"no firewall do provedor (ex.: Security List da Oracle).", "connect-host")
+    return {"ok": True, "handshake": bool(handshake), "gateway": {"ip": host_ip, "iface": iface},
+            "vps_address": str(current), "readdressed": bool(new_address), "port": conn.wg_listen_port}
 
 
 @router.get("/{vps_id}/peers")

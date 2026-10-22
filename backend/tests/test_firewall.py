@@ -85,3 +85,25 @@ def test_address_allocation_respects_live_peers():
     # 10.10.0.2 is the Proxmox host; .3/.4 are containers; one peer has no allowed-ips
     used = ["10.10.0.2/32", "10.10.0.3/32", "", "10.10.0.4/32", "10.10.0.10/32"]
     assert wg.find_free_wg_address(used, "10.10.0.1/24") == "10.10.0.5/24"
+
+
+def test_pick_subnet_avoids_routed_networks():
+    taken = ["10.10.0.0/24", "192.168.1.0/24", "172.17.0.0/16", "100.94.93.106/32", "10.0.1.0/24"]
+    assert wg.pick_subnet(taken) == "10.20.0.0/24"
+    assert wg.pick_subnet(taken + ["10.20.0.0/24"]) == "10.30.0.0/24"
+    try:
+        wg.pick_subnet(["10.0.0.0/8"])
+        assert False
+    except ValueError:
+        pass
+
+
+def test_connect_scripts_render():
+    key = "+xGIL5bkLlqowO8csYVyN6PMaF0zl+lZUwDmM/DSYR8="
+    s = wg.VPS_CONNECT_HOST.format(iface="wg0", new_address="", host_ip="10.20.0.2", host_pub=key, port=51820)
+    assert "--dport 51820" in s and "AllowedIPs = 10.20.0.2/32" in s and '{for(i=2' in s
+    c = wg.HOST_WG_CONF.format(vps_name="Ampere", vps_host="163.176.88.170", privkey="x", host_ip="10.20.0.2",
+                               prefix="24", vps_pub=key, vps_port=51820, network="10.20.0.0/24")
+    assert "Endpoint = 163.176.88.170:51820" in c and "Address = 10.20.0.2/24" in c
+    inst = wg.VPS_WG_SETUP.format(iface="wg0", privkey="x", address="10.30.0.1/24", port=51820)
+    assert "-I INPUT 1 -p udp --dport 51820 -j ACCEPT" in inst
