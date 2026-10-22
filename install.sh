@@ -69,8 +69,8 @@ systemctl daemon-reload
 systemctl enable wg-proxy-manager >/dev/null
 systemctl restart wg-proxy-manager
 
-PORT=$(grep -E '^PANEL_PORT=' .env | cut -d= -f2)
-HOST=$(grep -E '^PANEL_HOST=' .env | cut -d= -f2)
+PORT=$(grep -E '^PANEL_PORT=' .env | cut -d= -f2 || true)
+HOST=$(grep -E '^PANEL_HOST=' .env | cut -d= -f2 || true)
 echo ""
 echo "✓ WG Manager instalado"
 echo "  Acesse: http://${HOST:-$(hostname -I | awk '{print $1}')}:${PORT:-8765}"
