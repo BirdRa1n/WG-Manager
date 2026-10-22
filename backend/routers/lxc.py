@@ -1,14 +1,60 @@
+"""Proxmox guests (LXC + VMs) and the optional "WireGuard inside the container" mode."""
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from database import get_db, LXC, VPS
-from auth import get_current_user, authenticate_proxmox
-import proxmox_client as px
-import wireguard as wg
-import logger as log
 
-router = APIRouter(prefix="/api/lxc", tags=["lxc"])
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+import logger as log
+import proxmox_local as host
+import validators as val
+import wireguard as wg
+from auth import get_current_user
+from database import LXC, VPS, PortRule, get_db
+from vps_ssh import VPSConn, open_ssh
+
+router = APIRouter(prefix="/api/lxc", tags=["lxc"], dependencies=[Depends(get_current_user)])
+
+
+def _serialize(c: LXC) -> dict:
+    return {
+        "id": c.id, "vmid": c.vmid, "name": c.name, "proxmox_node": c.proxmox_node,
+        "wg_public_key": c.wg_public_key, "wg_address": c.wg_address, "wg_vps_id": c.wg_vps_id,
+        "status": c.status, "created_at": c.created_at.isoformat() + "Z" if c.created_at else None,
+    }
+
+
+def _get(lxc_id: int, db: Session) -> LXC:
+    c = db.get(LXC, lxc_id)
+    if not c:
+        raise HTTPException(404, "Container não encontrado")
+    return c
+
+
+async def _in_thread(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
+
+@router.get("/guests")
+async def guests(refresh: bool = False, db: Session = Depends(get_db)):
+    """Every LXC/VM on the cluster with its IPs, merged with what the panel knows about it."""
+    try:
+        items = await _in_thread(host.list_guests, refresh)
+    except host.HostError as e:
+        raise HTTPException(503, str(e))
+    managed = {c.vmid: c for c in db.query(LXC).all()}
+    rules = db.query(PortRule).all()
+    for g in items:
+        c = managed.get(g["vmid"])
+        g["managed"] = _serialize(c) if c else None
+        ips = {i["ip"] for i in g["ips"]} | ({c.wg_address.split("/")[0]} if c and c.wg_address else set())
+        g["forwards"] = sum(1 for r in rules if r.vmid == g["vmid"] or r.target_ip in ips)
+    return items
+
+
+@router.get("")
+def list_lxc(db: Session = Depends(get_db)):
+    return [_serialize(c) for c in db.query(LXC).order_by(LXC.vmid).all()]
 
 
 class LXCImport(BaseModel):
@@ -17,221 +63,180 @@ class LXCImport(BaseModel):
     proxmox_node: str = "pve"
 
 
-@router.get("/proxmox-list")
-def proxmox_list(ticket: str, node: str = "pve", user=Depends(get_current_user)):
-    try:
-        return px.list_lxc(ticket, node)
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@router.get("")
-def list_lxc(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    return [_serialize(c) for c in db.query(LXC).all()]
-
-
 @router.post("")
-def import_lxc(data: LXCImport, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def import_lxc(data: LXCImport, db: Session = Depends(get_db)):
     existing = db.query(LXC).filter(LXC.vmid == data.vmid).first()
     if existing:
         return _serialize(existing)
-    c = LXC(vmid=data.vmid, name=data.name, proxmox_node=data.proxmox_node, status="imported")
+    c = LXC(vmid=int(data.vmid), name=val.text(data.name, 60), proxmox_node=val.iface(data.proxmox_node, "Nó"), status="imported")
     db.add(c)
     db.commit()
     db.refresh(c)
     return _serialize(c)
 
 
-@router.get("/{lxc_id}/check-wg-existing")
-async def check_wg_existing(lxc_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    c = _get_or_404(lxc_id, db)
-    code, out = px.pct_exec(c.vmid, wg.LXC_CHECK_WG_EXISTING)
-    installed = "WG_INSTALLED=1" in out
-    running = "WG_RUNNING=1" in out
-    config_exists = "WG_CONFIG_EXISTS=1" in out
-    peer = ""
-    for line in out.splitlines():
-        if line.startswith("WG_PEER="):
-            peer = line.split("=", 1)[1].strip()
-    config = ""
-    if "---WG_CONFIG_START---" in out and "---WG_CONFIG_END---" in out:
-        start = out.index("---WG_CONFIG_START---") + len("---WG_CONFIG_START---\n")
-        end = out.index("---WG_CONFIG_END---")
-        config = out[start:end].strip()
-    return {
-        "installed": installed,
-        "running": running,
-        "config_exists": config_exists,
-        "peer": peer,
-        "config_preview": config[:500] if config else "",
-    }
-
-
-@router.post("/{lxc_id}/remove-wireguard")
-async def remove_wireguard(lxc_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    c = _get_or_404(lxc_id, db)
-    c_vmid = c.vmid
-
-    await log.emit("warn", f"Removing existing WireGuard from CT {c_vmid}...", "remove-wg")
-
-    def run():
-        from database import SessionLocal
-        thread_db = SessionLocal()
-        try:
-            for line in px.pct_exec_stream(c_vmid, wg.LXC_REMOVE_WG):
-                log.emit_sync("info", line, "remove-wg")
-            row = thread_db.query(LXC).filter(LXC.id == lxc_id).first()
-            if row:
-                row.wg_public_key = None
-                row.wg_private_key = None
-                row.wg_address = None
-                row.wg_vps_id = None
-                if row.status == "wg_ready":
-                    row.status = "ready"
-                thread_db.commit()
-            log.emit_sync("success", f"WireGuard removido do CT {c_vmid}", "remove-wg")
-        except Exception as e:
-            log.emit_sync("error", str(e), "remove-wg")
-        finally:
-            thread_db.close()
-
-    await asyncio.get_event_loop().run_in_executor(None, run)
-    return {"ok": True}
+@router.get("/{lxc_id}/check-wg")
+async def check_wg(lxc_id: int, db: Session = Depends(get_db)):
+    c = _get(lxc_id, db)
+    try:
+        _, out = await _in_thread(host.pct_exec, c.vmid, wg.LXC_CHECK_WG_EXISTING)
+    except Exception as e:
+        raise HTTPException(502, str(e))
+    kv = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    return {"installed": kv.get("WG_INSTALLED") == "1", "running": kv.get("WG_RUNNING") == "1",
+            "config_exists": kv.get("WG_CONFIG_EXISTS") == "1", "address": kv.get("WG_ADDRESS", ""),
+            "peer": kv.get("WG_PEER", "")}
 
 
 @router.post("/{lxc_id}/check-permissions")
-async def check_permissions(lxc_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    c = _get_or_404(lxc_id, db)
-    await log.emit("info", f"Checking permissions for CT {c.vmid}...", "check-perms")
-
-    def run():
-        code, out = px.pct_exec(c.vmid, wg.LXC_CHECK_PERMISSIONS)
-        log.emit_sync("info", out, "check-perms")
-        return "PERMISSIONS_OK" in out, out
-
-    ok, out = await asyncio.get_event_loop().run_in_executor(None, run)
-    if ok:
+async def check_permissions(lxc_id: int, db: Session = Depends(get_db)):
+    c = _get(lxc_id, db)
+    try:
+        _, out = await _in_thread(host.pct_exec, c.vmid, wg.LXC_CHECK_PERMISSIONS)
+    except Exception as e:
+        raise HTTPException(502, str(e))
+    ok = "PERMISSIONS_OK" in out
+    if ok and c.status == "imported":
         c.status = "ready"
         db.commit()
-    return {"ok": ok, "output": out, "issues": _parse_issues(out)}
+    issues = []
+    if "OS_NOT_SUPPORTED" in out:
+        issues.append({"key": "os", "message": "Sistema não é Debian/Ubuntu", "fixable": False})
+    if "WG_MODULE_MISSING" in out:
+        issues.append({"key": "wg_module", "message": "Não consegue criar interface WireGuard (habilitar nesting)", "fixable": True})
+    if "NET_ADMIN_MISSING" in out:
+        issues.append({"key": "net_admin", "message": "Sem permissão NET_ADMIN", "fixable": True})
+    return {"ok": ok, "issues": issues}
 
 
 @router.post("/{lxc_id}/fix-permissions")
-async def fix_permissions(lxc_id: int, ticket: str, csrf: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    c = _get_or_404(lxc_id, db)
-    await log.emit("info", f"Fixing permissions for CT {c.vmid}...", "fix-perms")
-    ok = px.fix_lxc_permissions(ticket, csrf, c.vmid, c.proxmox_node)
-    if ok:
-        await log.emit("success", f"Permissions fixed for CT {c.vmid}", "fix-perms")
-    else:
-        await log.emit("error", f"Failed to fix permissions for CT {c.vmid}", "fix-perms")
-    return {"ok": ok}
+async def fix_permissions(lxc_id: int, db: Session = Depends(get_db)):
+    c = _get(lxc_id, db)
+    ok, out = await _in_thread(host.enable_nesting, c.vmid)
+    await log.emit("success" if ok else "error", f"CT {c.vmid}: nesting {'habilitado' if ok else 'falhou'} {out}", "lxc")
+    return {"ok": ok, "output": out, "restart_required": ok}
+
+
+class WGInstall(BaseModel):
+    vps_id: int
+    full_tunnel: bool = False
 
 
 @router.post("/{lxc_id}/install-wireguard")
-async def install_wireguard(
-    lxc_id: int,
-    vps_id: int,
-    mode: str = "split_tunnel",
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-):
-    c = _get_or_404(lxc_id, db)
-    v = db.query(VPS).filter(VPS.id == vps_id).first()
+async def install_wireguard(lxc_id: int, data: WGInstall, db: Session = Depends(get_db)):
+    c = _get(lxc_id, db)
+    v = db.get(VPS, data.vps_id)
     if not v:
-        raise HTTPException(404, "VPS not found")
-    if not v.wg_public_key:
-        raise HTTPException(400, "VPS WireGuard not installed yet")
+        raise HTTPException(404, "VPS não encontrada")
+    if not v.wg_public_key or not v.wg_address:
+        raise HTTPException(400, "A VPS ainda não tem WireGuard configurado (use Detectar ou Instalar)")
+    if c.wg_public_key:
+        raise HTTPException(409, "Este container já tem WireGuard pelo painel. Remova antes de reinstalar.")
+    conn = VPSConn(v)
 
-    from database import LXC as LXCModel
-    used = [x.wg_address for x in db.query(LXCModel).filter(LXCModel.wg_address.isnot(None)).all()]
-    used += [x.wg_address for x in db.query(VPS).filter(VPS.wg_address.isnot(None)).all()]
-
-    priv, pub = wg.generate_keypair()
-    address = wg.find_free_wg_address(used)
+    # Allocate against the *live* peers of the VPS, not only the database.
+    def live_peers():
+        with open_ssh(conn, timeout=10) as ssh:
+            return wg.parse_dump(ssh.run(wg.VPS_PEERS.format(iface=conn.wg_interface), sudo=True)[1])
+    try:
+        peers = await _in_thread(live_peers)
+    except Exception as e:
+        raise HTTPException(502, f"Não foi possível ler os peers da VPS: {e}")
+    used = [p["allowed_ips"] or "" for p in peers]
+    used += [x.wg_address for x in db.query(LXC).filter(LXC.wg_address.isnot(None), LXC.wg_vps_id == v.id).all()]
+    used += [g["address"] for g in host.local_wg_interfaces() if g.get("address")]
+    address = wg.find_free_wg_address(used, v.wg_address)
+    prefix = address.split("/")[1]
     lxc_ip = address.split("/")[0]
-    allowed_ips = "0.0.0.0/0" if mode == "full_tunnel" else "10.10.0.0/24"
-
-    # Copy fields before thread to avoid detached instance error
-    lxc_vmid = c.vmid; lxc_name = c.name or f"CT-{c.vmid}"; lxc_id = c.id
-    vps_pubkey = v.wg_public_key; vps_host = v.host; vps_port = v.ssh_port
-    vps_user = v.ssh_user; vps_key = v.ssh_key_path
-    vps_wg_port = v.wg_listen_port or 51820; vps_iface = v.wg_interface or "wg0"
-    vps_id_val = v.id
-
-    await log.emit("info", f"Installing WireGuard on CT {lxc_vmid}...", "install-wg-lxc")
+    net = v.wg_address.split("/")[0].rsplit(".", 1)[0] + f".0/{prefix}"
+    allowed = "0.0.0.0/0" if data.full_tunnel else net
+    priv, pub = wg.generate_keypair()
+    vmid, name, cid = c.vmid, c.name or f"CT-{c.vmid}", c.id
+    await log.emit("info", f"Instalando WireGuard no CT {vmid} ({address})…", "install-wg-lxc")
 
     def run():
         from database import SessionLocal
-        thread_db = SessionLocal()
         try:
-            script = wg.LXC_WG_SETUP.format(
-                privkey=priv, address=address, vps_pubkey=vps_pubkey,
-                vps_host=vps_host, vps_port=vps_wg_port, allowed_ips=allowed_ips,
-            )
-            for line in px.pct_exec_stream(lxc_vmid, script):
+            with open_ssh(conn) as ssh:
+                code, out, _ = ssh.run(wg.VPS_ADD_PEER.format(iface=conn.wg_interface, pubkey=pub,
+                                                              allowed_ip=f"{lxc_ip}/32", label=val.text(name, 40)), sudo=True)
+            if "PEER_ADDED" not in out:
+                log.emit_sync("error", f"Falha ao adicionar peer na VPS: {out.strip()[-200:]}", "install-wg-lxc")
+                return
+            script = wg.LXC_WG_SETUP.format(privkey=priv, address=address, vps_pubkey=conn.wg_public_key,
+                                            vps_host=conn.host, vps_port=conn.wg_listen_port, allowed_ips=allowed)
+            for line in host.pct_exec_stream(vmid, script):
                 log.emit_sync("info", line, "install-wg-lxc")
-
-            log.emit_sync("info", "Adding peer on VPS...", "install-wg-lxc")
-            from ssh_manager import SSHClient as SSH
-            with SSH(vps_host, vps_port, vps_user, vps_key) as ssh:
-                peer_script = wg.VPS_ADD_PEER.format(
-                    iface=vps_iface, pubkey=pub,
-                    allowed_ips=f"{lxc_ip}/32", label=lxc_name,
-                )
-                code, out, _ = ssh.run(peer_script)
-                log.emit_sync("info" if code == 0 else "error", out, "install-wg-lxc")
-
-            row = thread_db.query(LXC).filter(LXC.id == lxc_id).first()
-            if row:
-                row.wg_private_key = priv
-                row.wg_public_key = pub
-                row.wg_address = address
-                row.wg_vps_id = vps_id_val
-                row.status = "wg_ready"
-                thread_db.commit()
-            log.emit_sync("success", f"WireGuard ready on CT {lxc_vmid} (IP: {lxc_ip})", "install-wg-lxc")
+            db2 = SessionLocal()
+            try:
+                row = db2.get(LXC, cid)
+                row.wg_private_key, row.wg_public_key, row.wg_address = priv, pub, address
+                row.wg_vps_id, row.status = conn.id, "wg_ready"
+                db2.commit()
+            finally:
+                db2.close()
+            log.emit_sync("success", f"WireGuard ativo no CT {vmid} ({lxc_ip})", "install-wg-lxc")
         except Exception as e:
             log.emit_sync("error", str(e), "install-wg-lxc")
-        finally:
-            thread_db.close()
 
-    await asyncio.get_event_loop().run_in_executor(None, run)
-    return {"ok": True, "wg_address": address, "lxc_ip": lxc_ip}
+    asyncio.get_running_loop().run_in_executor(None, run)
+    return {"ok": True, "wg_address": address}
 
 
-@router.delete("/{lxc_id}")
-def delete_lxc(lxc_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    c = _get_or_404(lxc_id, db)
-    db.delete(c)
+@router.post("/{lxc_id}/remove-wireguard")
+async def remove_wireguard(lxc_id: int, db: Session = Depends(get_db)):
+    c = _get(lxc_id, db)
+    v = db.get(VPS, c.wg_vps_id) if c.wg_vps_id else None
+    conn = VPSConn(v) if v else None
+    vmid, pub = c.vmid, c.wg_public_key
+    await log.emit("warn", f"Removendo WireGuard do CT {vmid}…", "remove-wg")
+
+    def run():
+        _, out = host.pct_exec(vmid, wg.LXC_REMOVE_WG)
+        log.emit_sync("info", out.strip(), "remove-wg")
+        if conn and pub:
+            with open_ssh(conn) as ssh:
+                ssh.run(wg.VPS_REMOVE_PEER.format(iface=conn.wg_interface, pubkey=pub), sudo=True)
+            log.emit_sync("info", f"Peer removido da VPS {conn.name}", "remove-wg")
+    try:
+        await _in_thread(run)
+    except Exception as e:
+        await log.emit("error", str(e), "remove-wg")
+        raise HTTPException(502, str(e))
+    c.wg_public_key = c.wg_private_key = c.wg_address = None
+    c.wg_vps_id = None
+    c.status = "ready"
     db.commit()
+    await log.emit("success", f"WireGuard removido do CT {vmid}", "remove-wg")
     return {"ok": True}
 
 
-def _get_or_404(lxc_id: int, db: Session) -> LXC:
-    c = db.query(LXC).filter(LXC.id == lxc_id).first()
-    if not c:
-        raise HTTPException(404, "LXC not found")
-    return c
+@router.delete("/{lxc_id}")
+async def delete_lxc(lxc_id: int, forget: bool = False, db: Session = Depends(get_db)):
+    """forget=true: the container no longer exists in Proxmox — drop the record and its VPS peer."""
+    c = _get(lxc_id, db)
+    if c.wg_public_key and not forget:
+        raise HTTPException(409, "Remova o WireGuard do container antes de tirá-lo do painel")
+    if forget:
+        try:
+            exists = any(g["vmid"] == c.vmid for g in await _in_thread(host.list_guests, True))
+        except host.HostError:
+            exists = False
+        if exists:
+            raise HTTPException(409, f"O CT {c.vmid} ainda existe no Proxmox — use Remover WireGuard")
+        v = db.get(VPS, c.wg_vps_id) if c.wg_vps_id else None
+        if v and c.wg_public_key:
+            conn, pub = VPSConn(v), c.wg_public_key
 
-
-def _parse_issues(output: str) -> list:
-    issues = []
-    if "OS_NOT_SUPPORTED" in output:
-        issues.append({"key": "os", "message": "OS não é Debian/Ubuntu", "fixable": False})
-    if "WG_MODULE_MISSING" in output:
-        issues.append({"key": "wg_module", "message": "Módulo WireGuard não disponível (habilite nesting=1)", "fixable": True})
-    if "NET_ADMIN_MISSING" in output:
-        issues.append({"key": "net_admin", "message": "Permissão NET_ADMIN ausente", "fixable": True})
-    return issues
-
-
-def _serialize(c: LXC) -> dict:
-    return {
-        "id": c.id, "vmid": c.vmid, "name": c.name,
-        "proxmox_node": c.proxmox_node,
-        "wg_public_key": c.wg_public_key, "wg_address": c.wg_address,
-        "wg_vps_id": c.wg_vps_id, "os_type": c.os_type,
-        "status": c.status,
-        "created_at": c.created_at.isoformat() if c.created_at else None,
-    }
+            def drop_peer():
+                with open_ssh(conn) as ssh:
+                    ssh.run(wg.VPS_REMOVE_PEER.format(iface=conn.wg_interface, pubkey=pub), sudo=True)
+            try:
+                await _in_thread(drop_peer)
+                await log.emit("info", f"Peer do CT {c.vmid} removido de {v.name}", "lxc")
+            except Exception as e:
+                await log.emit("warn", f"Peer do CT {c.vmid} não removido da VPS: {e}", "lxc")
+    db.query(PortRule).filter(PortRule.lxc_id == lxc_id).update({PortRule.lxc_id: None})
+    db.delete(c)
+    db.commit()
+    return {"ok": True}

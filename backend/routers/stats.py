@@ -1,144 +1,123 @@
-"""
-Live stats collector — polls WireGuard peer traffic every 60 s.
-Stores up to 60 data-points per peer (1 hour of history).
-"""
+"""Background collector: WireGuard peer traffic on every VPS, sampled every 60 s (1 h of history)."""
 import asyncio
-import re
+import time
 from collections import defaultdict, deque
 from datetime import datetime
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from database import get_db, VPS, LXC, PortRule, CloudflareTunnel
+
+import wireguard as wg
 from auth import get_current_user
-from ssh_manager import SSHClient
+from database import LXC, VPS, CloudflareTunnel, PortRule, SessionLocal, get_db
+from vps_ssh import VPSConn, open_ssh
 
-router = APIRouter(prefix="/api/stats", tags=["stats"])
+router = APIRouter(prefix="/api/stats", tags=["stats"], dependencies=[Depends(get_current_user)])
 
-# In-memory store: { vps_id: { peer_pubkey: deque([{ts, rx, tx, rx_delta, tx_delta}]) } }
-_peer_series: dict[int, dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=60)))
-_last_raw: dict[int, dict[str, tuple]] = {}   # vps_id → { pubkey: (rx_bytes, tx_bytes) }
-_collecting = False
+INTERVAL = 60
+_series: dict[int, dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=60)))
+_last_raw: dict[int, dict[str, tuple[int, int]]] = {}
+_last_peers: dict[int, list[dict]] = {}
+_health: dict[int, dict] = {}
+_started = False
 
 
-async def start_collector(vps_list_fn):
-    """Background loop — runs forever, polling every 60 s."""
-    global _collecting
-    if _collecting:
+async def start_collector():
+    global _started
+    if _started:
         return
-    _collecting = True
+    _started = True
+    await asyncio.sleep(3)
     while True:
         try:
-            await _poll_all(vps_list_fn)
+            db = SessionLocal()
+            try:
+                conns = [VPSConn(v) for v in db.query(VPS).filter(VPS.ssh_key_path.isnot(None)).all()]
+            finally:
+                db.close()
+            loop = asyncio.get_running_loop()
+            await asyncio.gather(*(loop.run_in_executor(None, _poll, c) for c in conns), return_exceptions=True)
         except Exception:
             pass
-        await asyncio.sleep(60)
+        await asyncio.sleep(INTERVAL)
 
 
-async def _poll_all(vps_list_fn):
-    from database import SessionLocal
-    db = SessionLocal()
+def _poll(conn: VPSConn):
+    started = time.time()
     try:
-        vpss = db.query(VPS).filter(VPS.wg_public_key.isnot(None)).all()
-        for v in vpss:
-            try:
-                await asyncio.get_event_loop().run_in_executor(None, lambda v=v: _poll_vps(v))
-            except Exception:
-                pass
-    finally:
-        db.close()
-
-
-def _poll_vps(v: VPS):
-    try:
-        with SSHClient(v.host, v.ssh_port, v.ssh_user, v.ssh_key_path) as ssh:
-            _, out, _ = ssh.run(
-                f"sudo wg show {v.wg_interface or 'wg0'} dump 2>/dev/null || "
-                f"wg show {v.wg_interface or 'wg0'} dump 2>/dev/null"
-            )
-    except Exception:
+        with open_ssh(conn, timeout=10) as ssh:
+            _, out, _ = ssh.run(wg.VPS_PEERS.format(iface=conn.wg_interface), sudo=True, timeout=20)
+    except Exception as e:
+        _health[conn.id] = {"ok": False, "error": str(e) or e.__class__.__name__, "ts": datetime.utcnow().isoformat() + "Z"}
         return
-
-    ts = datetime.utcnow().isoformat()
-    prev = _last_raw.get(v.id, {})
-    new_raw = {}
-
-    for line in out.strip().splitlines():
-        parts = line.split("\t")
-        if len(parts) < 7:
-            continue
-        pubkey = parts[0]
-        try:
-            rx = int(parts[5])
-            tx = int(parts[6])
-        except (ValueError, IndexError):
-            continue
-
-        prev_rx, prev_tx = prev.get(pubkey, (rx, tx))
-        rx_delta = max(0, rx - prev_rx)
-        tx_delta = max(0, tx - prev_tx)
-
-        _peer_series[v.id][pubkey].append({
-            "ts": ts,
-            "rx": rx,
-            "tx": tx,
-            "rx_delta": rx_delta,
-            "tx_delta": tx_delta,
+    latency = int((time.time() - started) * 1000)
+    ts = datetime.utcnow().isoformat() + "Z"
+    peers = wg.parse_dump(out)
+    prev = _last_raw.get(conn.id, {})
+    raw = {}
+    for p in peers:
+        rx, tx = p["rx_bytes"], p["tx_bytes"]
+        prx, ptx = prev.get(p["pubkey"], (rx, tx))
+        _series[conn.id][p["pubkey"]].append({
+            "ts": ts, "rx": rx, "tx": tx,
+            # counters reset when the peer reconnects → never report negative deltas
+            "rx_delta": rx - prx if rx >= prx else rx, "tx_delta": tx - ptx if tx >= ptx else tx,
         })
-        new_raw[pubkey] = (rx, tx)
+        raw[p["pubkey"]] = (rx, tx)
+    _last_raw[conn.id] = raw
+    _last_peers[conn.id] = peers
+    _health[conn.id] = {"ok": True, "latency_ms": latency, "ts": ts, "peers": len(peers)}
 
-    _last_raw[v.id] = new_raw
+
+def health() -> dict[int, dict]:
+    return dict(_health)
+
+
+def last_peers() -> dict[int, list[dict]]:
+    return dict(_last_peers)
 
 
 @router.get("/wg/{vps_id}")
-def wg_stats(vps_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    """Return time-series traffic per WG peer for the given VPS."""
-    from database import LXC as LXCModel
-    lxcs = {c.wg_public_key: c for c in db.query(LXCModel).filter(LXCModel.wg_public_key.isnot(None)).all()}
-    result = []
-    for pubkey, series in _peer_series.get(vps_id, {}).items():
-        lxc = lxcs.get(pubkey)
-        result.append({
-            "pubkey": pubkey,
-            "lxc_name": lxc.name if lxc else None,
-            "lxc_vmid": lxc.vmid if lxc else None,
-            "series": list(series),
-        })
-    return result
+def wg_stats(vps_id: int, db: Session = Depends(get_db)):
+    lxcs = {c.wg_public_key: c for c in db.query(LXC).filter(LXC.wg_public_key.isnot(None)).all()}
+    out = []
+    for pubkey, series in _series.get(vps_id, {}).items():
+        c = lxcs.get(pubkey)
+        out.append({"pubkey": pubkey, "lxc_name": c.name if c else None, "lxc_vmid": c.vmid if c else None,
+                    "series": list(series)})
+    return out
+
+
+@router.get("/traffic")
+def traffic():
+    """Aggregated rx/tx rate per minute across every VPS (for the dashboard chart)."""
+    buckets: dict[str, list[int]] = {}
+    for peers in _series.values():
+        for series in peers.values():
+            for pt in series:
+                key = pt["ts"][:16]
+                b = buckets.setdefault(key, [0, 0])
+                b[0] += pt["rx_delta"]
+                b[1] += pt["tx_delta"]
+    return [{"ts": k + ":00Z", "rx": v[0] / INTERVAL, "tx": v[1] / INTERVAL} for k, v in sorted(buckets.items())][-60:]
 
 
 @router.get("/summary")
-def summary(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    """Return counts and status summary for the dashboard."""
+def summary(db: Session = Depends(get_db)):
     vpss = db.query(VPS).all()
-    lxcs = db.query(LXC).all()
-    ports = db.query(PortRule).all()
+    rules = db.query(PortRule).all()
     tunnels = db.query(CloudflareTunnel).all()
-
-    wg_ready_vps = sum(1 for v in vpss if v.status == "wg_ready")
-    wg_ready_lxc = sum(1 for c in lxcs if c.status == "wg_ready")
-    active_ports = sum(1 for p in ports if p.enabled)
-    running_tunnels = sum(1 for t in tunnels if t.status == "running")
-
-    # Total traffic from last known values
-    total_rx = sum(v for vps_id, peers in _last_raw.items() for _, (rx, tx) in peers.items())
-    total_tx = sum(tx for vps_id, peers in _last_raw.items() for _, (rx, tx) in peers.items())
-
-    # Ports grouped by target IP
-    ip_counts: dict[str, int] = {}
-    for p in ports:
-        if p.target_ip:
-            ip_counts[p.target_ip] = ip_counts.get(p.target_ip, 0) + 1
-
+    total_rx = sum(rx for peers in _last_raw.values() for rx, _ in peers.values())
+    total_tx = sum(tx for peers in _last_raw.values() for _, tx in peers.values())
     return {
         "vps_total": len(vpss),
-        "vps_wg_ready": wg_ready_vps,
-        "lxc_total": len(lxcs),
-        "lxc_wg_ready": wg_ready_lxc,
-        "ports_total": len(ports),
-        "ports_active": active_ports,
+        "vps_online": sum(1 for v in vpss if _health.get(v.id, {}).get("ok")),
+        "lxc_total": db.query(LXC).count(),
+        "lxc_wg_ready": db.query(LXC).filter(LXC.wg_public_key.isnot(None)).count(),
+        "ports_total": len(rules),
+        "ports_active": sum(1 for r in rules if r.enabled),
         "tunnels_total": len(tunnels),
-        "tunnels_running": running_tunnels,
+        "tunnels_running": sum(1 for t in tunnels if t.status in ("running", "healthy")),
         "total_rx_bytes": total_rx,
         "total_tx_bytes": total_tx,
-        "ports_by_ip": ip_counts,
     }
