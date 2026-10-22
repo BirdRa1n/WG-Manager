@@ -5,8 +5,9 @@ from pydantic import BaseModel
 from typing import Optional
 from database import get_db, APICredential
 from auth import get_current_user
+import validators as val
 
-router = APIRouter(prefix="/api/credentials", tags=["credentials"])
+router = APIRouter(prefix="/api/credentials", tags=["credentials"], dependencies=[Depends(get_current_user)])
 
 CF_API = "https://api.cloudflare.com/client/v4"
 
@@ -28,17 +29,22 @@ class CredentialCreate(BaseModel):
 
 
 @router.get("")
-def list_credentials(db: Session = Depends(get_db), user=Depends(get_current_user)):
+def list_credentials(db: Session = Depends(get_db)):
     rows = db.query(APICredential).all()
     return [_serialize(c) for c in rows]
 
 
 @router.post("")
-def create_credential(data: CredentialCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def create_credential(data: CredentialCreate, db: Session = Depends(get_db)):
+    if data.provider != "cloudflare":
+        val.bad("Provedor não suportado")
+    token = data.api_token.strip()
+    if not 20 <= len(token) <= 512:
+        val.bad("Token de API inválido")
     c = APICredential(
-        name=data.name, provider=data.provider,
-        account_id=data.account_id, api_token=data.api_token,
-        notes=data.notes,
+        name=val.text(data.name, 60) or val.bad("Nome obrigatório"), provider=data.provider,
+        account_id=val.text(data.account_id, 64).replace("-", ""), api_token=token,
+        notes=val.text(data.notes, 500),
     )
     db.add(c)
     db.commit()
@@ -47,14 +53,14 @@ def create_credential(data: CredentialCreate, db: Session = Depends(get_db), use
 
 
 @router.post("/{cred_id}/verify")
-async def verify_credential(cred_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+async def verify_credential(cred_id: int, db: Session = Depends(get_db)):
     """Test the API token and detect which permissions it has."""
     c = _get_or_404(cred_id, db)
     headers = {"Authorization": f"Bearer {c.api_token}", "Content-Type": "application/json"}
     detected = []
     errors = []
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=20) as client:
         # Check token validity + zone:read
         r = await client.get(f"{CF_API}/user/tokens/verify", headers=headers)
         if not r.is_success:
@@ -91,15 +97,17 @@ async def verify_credential(cred_id: int, db: Session = Depends(get_db), user=De
 
 
 @router.delete("/{cred_id}")
-def delete_credential(cred_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def delete_credential(cred_id: int, db: Session = Depends(get_db)):
     c = _get_or_404(cred_id, db)
+    from database import CloudflareTunnel
+    db.query(CloudflareTunnel).filter(CloudflareTunnel.cred_id == cred_id).update({CloudflareTunnel.cred_id: None})
     db.delete(c)
     db.commit()
     return {"ok": True}
 
 
 @router.get("/cloudflare/active")
-def get_active_cf_credential(db: Session = Depends(get_db), user=Depends(get_current_user)):
+def get_active_cf_credential(db: Session = Depends(get_db)):
     """Return first CF credential that has both tunnel_edit and dns_edit."""
     rows = db.query(APICredential).filter(APICredential.provider == "cloudflare").all()
     for c in rows:
@@ -126,7 +134,7 @@ def _serialize(c: APICredential) -> dict:
     return {
         "id": c.id, "name": c.name, "provider": c.provider,
         "account_id": c.account_id,
-        "api_token_preview": c.api_token[:8] + "..." if c.api_token else "",
+        "api_token_preview": "••••" + c.api_token[-4:] if c.api_token else "",
         "permissions": perms,
         "permission_labels": perm_labels,
         "notes": c.notes,
