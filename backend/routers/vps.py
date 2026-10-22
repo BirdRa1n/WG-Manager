@@ -1,316 +1,289 @@
-import os
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
-from sqlalchemy.orm import Session
+import os
+import uuid
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
-from database import get_db, VPS
-from auth import get_current_user
-from ssh_manager import SSHClient, test_ssh_connection
-import wireguard as wg
+from sqlalchemy.orm import Session
+
+import config
 import logger as log
+import proxmox_local as host
+import validators as val
+import wireguard as wg
+from auth import get_current_user
+from database import LXC, VPS, PortRule, get_db
+from ssh_manager import fingerprint_sha256
+from vps_ssh import VPSConn, open_ssh
 
-SSH_KEYS_DIR = os.getenv("SSH_KEYS_DIR", "/opt/wg-proxy-manager/keys")
-os.makedirs(SSH_KEYS_DIR, exist_ok=True)
+router = APIRouter(prefix="/api/vps", tags=["vps"], dependencies=[Depends(get_current_user)])
 
-router = APIRouter(prefix="/api/vps", tags=["vps"])
-
-
-class VPSCreate(BaseModel):
-    name: str
-    host: str
-    ssh_port: int = 22
-    ssh_user: str = "root"
-
-
-@router.get("")
-def list_vps(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    items = db.query(VPS).all()
-    return [_serialize(v) for v in items]
-
-
-@router.post("")
-async def create_vps(
-    name: str = Form(...),
-    host: str = Form(...),
-    ssh_port: int = Form(22),
-    ssh_user: str = Form("root"),
-    ssh_key: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-):
-    key_path = os.path.join(SSH_KEYS_DIR, f"vps_{name.replace(' ', '_')}.key")
-    content = await ssh_key.read()
-    with open(key_path, "wb") as f:
-        f.write(content)
-    os.chmod(key_path, 0o600)
-
-    v = VPS(name=name, host=host, ssh_port=ssh_port, ssh_user=ssh_user, ssh_key_path=key_path, status="pending")
-    db.add(v)
-    db.commit()
-    db.refresh(v)
-    return _serialize(v)
-
-
-@router.post("/{vps_id}/test")
-async def test_connection(vps_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    v = _get_or_404(vps_id, db)
-    ok = test_ssh_connection(v.host, v.ssh_port, v.ssh_user, v.ssh_key_path)
-    if ok:
-        v.status = "connected"
-        db.commit()
-    return {"ok": ok}
-
-
-@router.post("/{vps_id}/install-wireguard")
-async def install_wireguard(vps_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    v = _get_or_404(vps_id, db)
-    used = [x.wg_address for x in db.query(VPS).filter(VPS.wg_address.isnot(None)).all()]
-    priv, pub = wg.generate_keypair()
-    address = wg.find_free_wg_address(used)
-
-    # Copy all needed fields before thread (avoid detached instance error)
-    vps_host = v.host; vps_port = v.ssh_port; vps_user = v.ssh_user
-    vps_key = v.ssh_key_path; vps_iface = v.wg_interface or "wg0"
-    vps_wg_port = v.wg_listen_port or 51820; vps_name = v.name
-
-    await log.emit("info", f"Connecting to VPS {vps_host}...", "install-wg")
-
-    def run():
-        from database import SessionLocal
-        thread_db = SessionLocal()
-        try:
-            with SSHClient(vps_host, vps_port, vps_user, vps_key) as ssh:
-                _, iface, _ = ssh.run("ip route | awk '/default/ {print $5; exit}'")
-                pub_iface = iface.strip() or "ens3"
-                log.emit_sync("info", f"Public interface: {pub_iface}", "install-wg")
-
-                script = wg.VPS_WG_SETUP.format(
-                    iface=vps_iface, privkey=priv, address=address,
-                    port=vps_wg_port, pub_iface=pub_iface,
-                )
-
-                def cb(level, msg):
-                    log.emit_sync(level, msg, "install-wg")
-
-                code, out, _ = ssh.run(script, log_cb=cb)
-                if "WG_SETUP_OK" in out or code == 0:
-                    row = thread_db.query(VPS).filter(VPS.id == vps_id).first()
-                    if row:
-                        row.wg_private_key = priv
-                        row.wg_public_key = pub
-                        row.wg_address = address
-                        row.pub_interface = pub_iface
-                        row.status = "wg_ready"
-                        thread_db.commit()
-                    log.emit_sync("success", f"WireGuard installed on VPS {vps_name}!", "install-wg")
-                else:
-                    log.emit_sync("error", f"Installation failed: {out}", "install-wg")
-        except Exception as e:
-            log.emit_sync("error", str(e), "install-wg")
-        finally:
-            thread_db.close()
-
-    asyncio.get_event_loop().run_in_executor(None, run)
-    return {"ok": True, "wg_address": address, "wg_public_key": pub}
-
-
-@router.post("/{vps_id}/detect-wireguard")
-async def detect_wireguard(vps_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    """Read existing WireGuard config from VPS and import into DB."""
-    v = _get_or_404(vps_id, db)
-    # Copy fields before possible async gap
-    v_host = v.host; v_port = v.ssh_port; v_user = v.ssh_user; v_key = v.ssh_key_path
-    await log.emit("info", f"Conectando em {v_host}...", "detect-wg")
-    try:
-        with SSHClient(v_host, v_port, v_user, v_key) as ssh:
-            DETECT = """
-SUDO=""
-[ "$(id -u)" != "0" ] && SUDO="sudo"
-echo "=== WG_INSTALLED ==="
-command -v wg > /dev/null 2>&1 && echo "YES" || echo "NO"
-echo "=== WG_RUNNING ==="
-$SUDO wg show wg0 2>/dev/null && echo "RUNNING" || echo "NOT_RUNNING"
-echo "=== WG_CONF ==="
-$SUDO cat /etc/wireguard/wg0.conf 2>/dev/null || echo "NO_CONF"
-echo "=== PUB_IFACE ==="
-ip route | awk '/default/ {print $5; exit}'
-echo "=== IPTABLES ==="
-$SUDO iptables -t nat -L PREROUTING -n 2>/dev/null
-"""
-            _, out, _ = ssh.run(DETECT)
-    except Exception as e:
-        raise HTTPException(500, f"SSH error: {e}")
-
-    sections = {}
-    cur = None
-    for line in out.splitlines():
-        if line.startswith("=== ") and line.endswith(" ==="):
-            cur = line[4:-4]
-            sections[cur] = []
-        elif cur:
-            sections[cur].append(line)
-
-    installed = "YES" in "\n".join(sections.get("WG_INSTALLED", []))
-    if not installed:
-        return {"detected": False, "message": "WireGuard não instalado na VPS"}
-
-    conf_lines = sections.get("WG_CONF", [])
-    conf_text = "\n".join(conf_lines)
-
-    if "NO_CONF" in conf_text:
-        return {"detected": False, "message": "WireGuard instalado mas sem wg0.conf"}
-
-    # Parse wg0.conf
-    priv_key, address, listen_port = "", "", 51820
-    for line in conf_lines:
-        line = line.strip()
-        if line.startswith("PrivateKey"):
-            priv_key = line.split("=", 1)[1].strip()
-        elif line.startswith("Address"):
-            address = line.split("=", 1)[1].strip()
-        elif line.startswith("ListenPort"):
-            try: listen_port = int(line.split("=", 1)[1].strip())
-            except: pass
-
-    # Derive public key from private key
-    pub_key = ""
-    if priv_key:
-        try:
-            import subprocess
-            pub_key = subprocess.check_output(
-                ["wg", "pubkey"], input=priv_key.encode()
-            ).decode().strip()
-        except Exception:
-            pub_key = ""
-
-    pub_iface = "\n".join(sections.get("PUB_IFACE", [])).strip() or "ens3"
-
-    # Parse iptables DNAT rules
-    import re
-    from database import PortRule
-    iptables_out = "\n".join(sections.get("IPTABLES", []))
-    port_rules = []
-    for line in iptables_out.splitlines():
-        m = re.search(r'(tcp|udp)\s+.*dpt:(\d+)\s+to:([^\s:]+):(\d+)', line)
-        if m:
-            port_rules.append({
-                "protocol": m.group(1), "port": int(m.group(2)),
-                "target_ip": m.group(3), "target_port": int(m.group(4)),
-            })
-
-    # Save to DB
-    v.wg_private_key = priv_key
-    v.wg_public_key = pub_key
-    v.wg_address = address
-    v.wg_listen_port = listen_port
-    v.wg_interface = "wg0"
-    v.pub_interface = pub_iface
-    v.status = "wg_ready"
-
-    # Import port rules not yet in DB
-    imported_ports = 0
-    for rule in port_rules:
-        exists = db.query(PortRule).filter(
-            PortRule.vps_id == vps_id,
-            PortRule.port == rule["port"],
-            PortRule.protocol == rule["protocol"],
-        ).first()
-        if not exists:
-            db.add(PortRule(
-                vps_id=vps_id, port=rule["port"], protocol=rule["protocol"],
-                mode="simple_dnat", target_ip=rule["target_ip"],
-                target_port=rule["target_port"], description="Importado do VPS",
-                enabled=True,
-            ))
-            imported_ports += 1
-
-    db.commit()
-    return {
-        "detected": True,
-        "wg_address": address,
-        "wg_public_key": pub_key,
-        "listen_port": listen_port,
-        "pub_interface": pub_iface,
-        "ports_imported": imported_ports,
-        "port_rules": port_rules,
-    }
-
-
-@router.get("/{vps_id}/wg-peers")
-def wg_peers(vps_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    """Read live WireGuard peers from VPS and correlate with panel DB."""
-    v = _get_or_404(vps_id, db)
-    try:
-        with SSHClient(v.host, v.ssh_port, v.ssh_user, v.ssh_key_path) as ssh:
-            _, out, _ = ssh.run("sudo wg show wg0 dump 2>/dev/null || wg show wg0 dump 2>/dev/null")
-    except Exception as e:
-        raise HTTPException(500, f"SSH error: {e}")
-
-    from database import LXC as LXCModel
-    lxcs = db.query(LXCModel).filter(LXCModel.wg_public_key.isnot(None)).all()
-    lxc_by_pubkey = {c.wg_public_key: c for c in lxcs}
-
-    peers = []
-    for line in out.strip().splitlines():
-        parts = line.split("\t")
-        if len(parts) < 5:
-            continue
-        pubkey, _preshared, endpoint, allowed_ips, last_handshake = parts[0], parts[1], parts[2], parts[3], parts[4]
-        rx_bytes = int(parts[5]) if len(parts) > 5 else 0
-        tx_bytes = int(parts[6]) if len(parts) > 6 else 0
-
-        lxc = lxc_by_pubkey.get(pubkey)
-        peers.append({
-            "pubkey": pubkey,
-            "endpoint": endpoint if endpoint != "(none)" else None,
-            "allowed_ips": allowed_ips if allowed_ips != "(none)" else None,
-            "last_handshake": int(last_handshake) if last_handshake.isdigit() else 0,
-            "rx_bytes": rx_bytes,
-            "tx_bytes": tx_bytes,
-            "lxc_id": lxc.id if lxc else None,
-            "lxc_name": lxc.name if lxc else None,
-            "lxc_vmid": lxc.vmid if lxc else None,
-            "in_panel": lxc is not None,
-        })
-
-    return peers
-
-
-@router.delete("/{vps_id}")
-def delete_vps(vps_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    v = _get_or_404(vps_id, db)
-    if v.ssh_key_path and os.path.exists(v.ssh_key_path):
-        os.remove(v.ssh_key_path)
-    db.delete(v)
-    db.commit()
-    return {"ok": True}
-
-
-@router.get("/{vps_id}/wg-status")
-def wg_status(vps_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    v = _get_or_404(vps_id, db)
-    try:
-        with SSHClient(v.host, v.ssh_port, v.ssh_user, v.ssh_key_path) as ssh:
-            _, out, _ = ssh.run(f"wg show {v.wg_interface or 'wg0'} 2>/dev/null || echo 'not running'")
-            return {"output": out}
-    except Exception as e:
-        return {"output": str(e)}
-
-
-def _get_or_404(vps_id: int, db: Session) -> VPS:
-    v = db.query(VPS).filter(VPS.id == vps_id).first()
-    if not v:
-        raise HTTPException(404, "VPS not found")
-    return v
+MAX_KEY_BYTES = 16 * 1024
 
 
 def _serialize(v: VPS) -> dict:
     return {
         "id": v.id, "name": v.name, "host": v.host,
         "ssh_port": v.ssh_port, "ssh_user": v.ssh_user,
+        "ssh_host_key": fingerprint_sha256(v.ssh_host_key),
         "wg_public_key": v.wg_public_key, "wg_address": v.wg_address,
         "wg_listen_port": v.wg_listen_port, "wg_interface": v.wg_interface,
-        "pub_interface": v.pub_interface, "status": v.status,
-        "created_at": v.created_at.isoformat() if v.created_at else None,
+        "pub_interface": v.pub_interface,
+        "gw_ip": v.gw_ip, "gw_iface": v.gw_iface, "lan_iface": v.lan_iface,
+        "status": v.status, "last_error": v.last_error,
+        "last_seen": v.last_seen.isoformat() + "Z" if v.last_seen else None,
+        "created_at": v.created_at.isoformat() + "Z" if v.created_at else None,
+        "rules": len(v.port_rules),
     }
+
+
+def _get(vps_id: int, db: Session) -> VPS:
+    v = db.get(VPS, vps_id)
+    if not v:
+        raise HTTPException(404, "VPS não encontrada")
+    return v
+
+
+async def _in_thread(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
+
+@router.get("")
+def list_vps(db: Session = Depends(get_db)):
+    return [_serialize(v) for v in db.query(VPS).order_by(VPS.id).all()]
+
+
+@router.post("")
+async def create_vps(
+    name: str = Form(...), host_: str = Form(..., alias="host"), ssh_port: int = Form(22),
+    ssh_user: str = Form("root"), ssh_key: UploadFile = File(...), db: Session = Depends(get_db),
+):
+    name = val.text(name, 60) or val.bad("Nome obrigatório")
+    content = await ssh_key.read(MAX_KEY_BYTES + 1)
+    if len(content) > MAX_KEY_BYTES or b"PRIVATE KEY" not in content:
+        val.bad("Envie uma chave privada SSH válida (OpenSSH/PEM)")
+    # Random filename: user input never becomes part of a path.
+    key_path = os.path.join(config.SSH_KEYS_DIR, f"vps_{uuid.uuid4().hex}.key")
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(content)
+    v = VPS(name=name, host=val.host(host_), ssh_port=val.port(ssh_port, "Porta SSH"),
+            ssh_user=val.ssh_user(ssh_user), ssh_key_path=key_path, status="pending",
+            lan_iface=host.default_lan_iface())
+    db.add(v)
+    db.commit()
+    db.refresh(v)
+    await log.emit("info", f"VPS {v.name} cadastrada", "vps")
+    return _serialize(v)
+
+
+class VPSUpdate(BaseModel):
+    name: str | None = None
+    ssh_port: int | None = None
+    ssh_user: str | None = None
+    pub_interface: str | None = None
+    wg_interface: str | None = None
+    gw_ip: str | None = None
+    gw_iface: str | None = None
+    lan_iface: str | None = None
+
+
+@router.patch("/{vps_id}")
+def update_vps(vps_id: int, data: VPSUpdate, db: Session = Depends(get_db)):
+    v = _get(vps_id, db)
+    d = data.model_dump(exclude_unset=True)
+    if "name" in d: v.name = val.text(d["name"], 60) or val.bad("Nome obrigatório")
+    if "ssh_port" in d: v.ssh_port = val.port(d["ssh_port"], "Porta SSH")
+    if "ssh_user" in d: v.ssh_user = val.ssh_user(d["ssh_user"])
+    if "pub_interface" in d: v.pub_interface = val.iface(d["pub_interface"])
+    if "wg_interface" in d: v.wg_interface = val.iface(d["wg_interface"])
+    if "gw_ip" in d: v.gw_ip = val.ipv4(d["gw_ip"], "IP do gateway") if d["gw_ip"] else None
+    if "gw_iface" in d: v.gw_iface = val.iface(d["gw_iface"]) if d["gw_iface"] else None
+    if "lan_iface" in d: v.lan_iface = val.iface(d["lan_iface"])
+    db.commit()
+    return _serialize(v)
+
+
+@router.post("/{vps_id}/reset-host-key")
+def reset_host_key(vps_id: int, db: Session = Depends(get_db)):
+    v = _get(vps_id, db)
+    v.ssh_host_key = None
+    db.commit()
+    return _serialize(v)
+
+
+@router.post("/{vps_id}/test")
+async def test_connection(vps_id: int, db: Session = Depends(get_db)):
+    v = _get(vps_id, db)
+    conn = VPSConn(v)
+
+    def run():
+        with open_ssh(conn) as ssh:
+            code, out, err = ssh.run("echo ok; sudo -n true 2>/dev/null && echo SUDO_OK || true; id -u")
+            return code, out, err
+    try:
+        code, out, _ = await _in_thread(run)
+    except Exception as e:
+        return {"ok": False, "error": str(e) or e.__class__.__name__}
+    can_root = conn.ssh_user == "root" or "SUDO_OK" in out
+    db.refresh(v)
+    if v.status == "pending":
+        v.status = "connected"
+        db.commit()
+    return {"ok": code == 0 and "ok" in out, "root": can_root, "host_key": fingerprint_sha256(v.ssh_host_key)}
+
+
+@router.post("/{vps_id}/detect")
+async def detect(vps_id: int, db: Session = Depends(get_db)):
+    """Read the existing WireGuard config on the VPS and the matching gateway on this host."""
+    v = _get(vps_id, db)
+    conn = VPSConn(v)
+
+    def run():
+        with open_ssh(conn) as ssh:
+            return ssh.run(wg.VPS_DETECT.format(iface=conn.wg_interface), sudo=True)[1]
+    try:
+        out = await _in_thread(run)
+    except Exception as e:
+        raise HTTPException(502, f"SSH: {e}")
+
+    import firewall as fw
+    secs = fw.split_sections(out)
+    if "YES" not in secs.get("WG_INSTALLED", []):
+        return {"detected": False, "message": "WireGuard não está instalado na VPS"}
+    conf = secs.get("WG_CONF", [])
+    if conf == ["NO_CONF"]:
+        return {"detected": False, "message": f"WireGuard instalado, mas sem /etc/wireguard/{conn.wg_interface}.conf"}
+    priv, address, listen = "", "", 51820
+    for line in conf:
+        k, _, val_ = line.partition("=")
+        k, val_ = k.strip(), val_.strip()
+        if k == "PrivateKey": priv = val_
+        elif k == "Address": address = val_.split(",")[0].strip()
+        elif k == "ListenPort" and val_.isdigit(): listen = int(val_)
+    pub = ""
+    if priv:
+        try:
+            pub = wg.public_key(priv)
+        except Exception:
+            pub = ""
+    pub_iface = (secs.get("PUB_IFACE") or [""])[0].strip() or v.pub_interface or "ens3"
+
+    v.wg_public_key = pub or v.wg_public_key
+    v.wg_address = address or v.wg_address
+    v.wg_listen_port = listen
+    v.pub_interface = val.iface(pub_iface)
+    v.status = "wg_ready"
+    gw = await _in_thread(host.detect_gateway, v.host, pub or None)
+    if gw:
+        v.gw_ip, v.gw_iface = gw["ip"], gw["iface"]
+        v.lan_iface = v.lan_iface or host.default_lan_iface()
+    db.commit()
+    await log.emit("success", f"{v.name}: WireGuard {address} detectado" + (f", gateway {gw['ip']} via {gw['iface']}" if gw else ""), "vps")
+    return {"detected": True, "wg_address": address, "wg_public_key": pub, "listen_port": listen,
+            "pub_interface": pub_iface, "gateway": gw}
+
+
+@router.post("/{vps_id}/install-wireguard")
+async def install_wireguard(vps_id: int, db: Session = Depends(get_db)):
+    v = _get(vps_id, db)
+    if v.wg_public_key:
+        raise HTTPException(409, "Esta VPS já tem WireGuard configurado. Use 'Detectar' para reimportar.")
+    priv, pub = wg.generate_keypair()
+    address = "10.10.0.1/24"
+    conn = VPSConn(v)
+    await log.emit("info", f"Instalando WireGuard em {v.name}…", "install-wg")
+
+    def run():
+        from database import SessionLocal
+        try:
+            with open_ssh(conn, timeout=20) as ssh:
+                _, iface, _ = ssh.run("ip route | awk '/default/ {print $5; exit}'")
+                pub_iface = val.iface(iface.strip() or "ens3")
+                script = wg.VPS_WG_SETUP.format(iface=conn.wg_interface, privkey=priv, address=address, port=conn.wg_listen_port)
+                code, out, _ = ssh.run(script, sudo=True, timeout=600,
+                                       log_cb=lambda lvl, msg: log.emit_sync(lvl, msg, "install-wg"))
+            if code != 0 or "WG_SETUP_OK" not in out:
+                log.emit_sync("error", f"Instalação falhou (código {code})", "install-wg")
+                return
+            db2 = SessionLocal()
+            try:
+                row = db2.get(VPS, conn.id)
+                row.wg_private_key, row.wg_public_key, row.wg_address = priv, pub, address
+                row.pub_interface, row.status = pub_iface, "wg_ready"
+                db2.commit()
+            finally:
+                db2.close()
+            log.emit_sync("success", f"WireGuard ativo em {conn.name} ({address})", "install-wg")
+        except Exception as e:
+            log.emit_sync("error", str(e), "install-wg")
+
+    asyncio.get_running_loop().run_in_executor(None, run)
+    return {"ok": True, "started": True}
+
+
+@router.get("/{vps_id}/peers")
+async def peers(vps_id: int, db: Session = Depends(get_db)):
+    v = _get(vps_id, db)
+    conn = VPSConn(v)
+
+    def run():
+        with open_ssh(conn, timeout=10) as ssh:
+            return ssh.run(wg.VPS_PEERS.format(iface=conn.wg_interface), sudo=True)[1]
+    try:
+        out = await _in_thread(run)
+    except Exception as e:
+        raise HTTPException(502, f"SSH: {e}")
+    lxcs = {c.wg_public_key: c for c in db.query(LXC).filter(LXC.wg_public_key.isnot(None)).all()}
+    local = {i["public_key"]: i for i in await _in_thread(host.local_wg_interfaces)}
+    result = []
+    for p in wg.parse_dump(out):
+        c = lxcs.get(p["pubkey"])
+        label, kind = None, "unknown"
+        if p["pubkey"] in local:
+            label, kind = f"Host Proxmox ({local[p['pubkey']]['name']})", "host"
+        elif c:
+            label, kind = f"CT {c.vmid} · {c.name}", "lxc"
+        p.update(label=label, kind=kind, lxc_id=c.id if c else None,
+                 orphan=not p["allowed_ips"])
+        result.append(p)
+    return result
+
+
+class PeerRemove(BaseModel):
+    pubkey: str
+
+
+@router.post("/{vps_id}/peers/remove")
+async def remove_peer(vps_id: int, data: PeerRemove, db: Session = Depends(get_db)):
+    v = _get(vps_id, db)
+    key = val.wg_key(data.pubkey)
+    local = {i["public_key"] for i in await _in_thread(host.local_wg_interfaces)}
+    if key in local:
+        raise HTTPException(400, "Este peer é o próprio host Proxmox — removê-lo derruba todos os encaminhamentos")
+    conn = VPSConn(v)
+
+    def run():
+        with open_ssh(conn) as ssh:
+            return ssh.run(wg.VPS_REMOVE_PEER.format(iface=conn.wg_interface, pubkey=key), sudo=True)
+    code, out, err = await _in_thread(run)
+    if "PEER_REMOVED" not in out:
+        raise HTTPException(500, (err or out).strip()[-300:])
+    await log.emit("warn", f"{v.name}: peer {key[:10]}… removido", "vps")
+    return {"ok": True}
+
+
+@router.delete("/{vps_id}")
+def delete_vps(vps_id: int, db: Session = Depends(get_db)):
+    v = _get(vps_id, db)
+    if db.query(PortRule).filter(PortRule.vps_id == vps_id, PortRule.enabled.is_(True)).count():
+        raise HTTPException(409, "Remova ou desative os encaminhamentos desta VPS antes de excluí-la")
+    if v.ssh_key_path and os.path.realpath(v.ssh_key_path).startswith(os.path.realpath(config.SSH_KEYS_DIR) + os.sep):
+        try:
+            os.remove(v.ssh_key_path)
+        except FileNotFoundError:
+            pass
+    db.query(LXC).filter(LXC.wg_vps_id == vps_id).update({LXC.wg_vps_id: None})
+    db.delete(v)
+    db.commit()
+    return {"ok": True}

@@ -11,7 +11,7 @@ def _headers(api_token: str) -> dict:
 async def create_tunnel(account_id: str, api_token: str, name: str) -> dict:
     # Cloudflare account IDs are 32-char hex without hyphens
     account_id = account_id.replace("-", "")
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(
             f"{CF_API}/accounts/{account_id}/cfd_tunnel",
             headers=_headers(api_token),
@@ -26,7 +26,7 @@ async def create_tunnel(account_id: str, api_token: str, name: str) -> dict:
 
 async def get_tunnel_token(account_id: str, api_token: str, tunnel_id: str) -> str:
     account_id = account_id.replace("-", "")
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(
             f"{CF_API}/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token",
             headers=_headers(api_token),
@@ -37,7 +37,7 @@ async def get_tunnel_token(account_id: str, api_token: str, tunnel_id: str) -> s
 
 async def get_tunnel_status(account_id: str, api_token: str, tunnel_id: str) -> str:
     account_id = account_id.replace("-", "")
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(
             f"{CF_API}/accounts/{account_id}/cfd_tunnel/{tunnel_id}",
             headers=_headers(api_token),
@@ -52,58 +52,60 @@ async def update_tunnel_config(account_id: str, api_token: str, tunnel_id: str, 
     account_id = account_id.replace("-", "")
     ingress = [{"hostname": r["public_url"], "service": r["service"]} for r in routes]
     ingress.append({"service": "http_status:404"})
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=20) as client:
         r = await client.put(
             f"{CF_API}/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
             headers=_headers(api_token),
             json={"config": {"ingress": ingress}},
         )
-        return r.status_code in (200, 204)
+        if not r.is_success:
+            raise Exception(f"CF API {r.status_code}: {r.text[:300]}")
+        return True
+
+
+async def _zone_for(client: httpx.AsyncClient, api_token: str, hostname: str) -> str:
+    """Longest matching zone (works for sub.example.com.br, not only the last two labels)."""
+    labels = hostname.split(".")
+    for i in range(len(labels) - 1):
+        candidate = ".".join(labels[i:])
+        r = await client.get(f"{CF_API}/zones", params={"name": candidate}, headers=_headers(api_token))
+        zones = r.json().get("result", []) if r.is_success else []
+        if zones:
+            return zones[0]["id"]
+    raise Exception(f"Zona DNS não encontrada para '{hostname}'")
 
 
 async def create_dns_route(account_id: str, api_token: str, tunnel_id: str, hostname: str) -> bool:
-    """Create CNAME DNS record pointing hostname to tunnel."""
-    account_id = account_id.replace("-", "")
-    # First get zone_id for the hostname domain
-    domain = ".".join(hostname.split(".")[-2:])
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{CF_API}/zones?name={domain}",
-            headers=_headers(api_token),
-        )
-        zones = r.json().get("result", [])
-        if not zones:
-            raise Exception(f"Zona DNS não encontrada para domínio '{domain}'")
-        zone_id = zones[0]["id"]
-
-        # Create/update CNAME record
-        cname_value = f"{tunnel_id}.cfargotunnel.com"
-        # Check if record exists
-        r2 = await client.get(
-            f"{CF_API}/zones/{zone_id}/dns_records?name={hostname}&type=CNAME",
-            headers=_headers(api_token),
-        )
-        existing = r2.json().get("result", [])
+    """Create (or update) the proxied CNAME hostname → <tunnel>.cfargotunnel.com."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        zone_id = await _zone_for(client, api_token, hostname)
+        body = {"type": "CNAME", "name": hostname, "content": f"{tunnel_id}.cfargotunnel.com", "proxied": True}
+        r2 = await client.get(f"{CF_API}/zones/{zone_id}/dns_records", params={"name": hostname, "type": "CNAME"},
+                              headers=_headers(api_token))
+        existing = r2.json().get("result", []) if r2.is_success else []
         if existing:
-            record_id = existing[0]["id"]
-            r3 = await client.put(
-                f"{CF_API}/zones/{zone_id}/dns_records/{record_id}",
-                headers=_headers(api_token),
-                json={"type": "CNAME", "name": hostname, "content": cname_value, "proxied": True},
-            )
-            return r3.is_success
+            r3 = await client.put(f"{CF_API}/zones/{zone_id}/dns_records/{existing[0]['id']}", headers=_headers(api_token), json=body)
         else:
-            r3 = await client.post(
-                f"{CF_API}/zones/{zone_id}/dns_records",
-                headers=_headers(api_token),
-                json={"type": "CNAME", "name": hostname, "content": cname_value, "proxied": True},
-            )
-            return r3.is_success
+            r3 = await client.post(f"{CF_API}/zones/{zone_id}/dns_records", headers=_headers(api_token), json=body)
+        return r3.is_success
+
+
+async def delete_dns_route(api_token: str, tunnel_id: str, hostname: str) -> bool:
+    """Remove the CNAME only if it still points to this tunnel."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        zone_id = await _zone_for(client, api_token, hostname)
+        r = await client.get(f"{CF_API}/zones/{zone_id}/dns_records", params={"name": hostname, "type": "CNAME"},
+                             headers=_headers(api_token))
+        for rec in (r.json().get("result", []) if r.is_success else []):
+            if rec.get("content") == f"{tunnel_id}.cfargotunnel.com":
+                d = await client.delete(f"{CF_API}/zones/{zone_id}/dns_records/{rec['id']}", headers=_headers(api_token))
+                return d.is_success
+        return False
 
 
 async def delete_tunnel(account_id: str, api_token: str, tunnel_id: str) -> bool:
     account_id = account_id.replace("-", "")
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=20) as client:
         r = await client.delete(
             f"{CF_API}/accounts/{account_id}/cfd_tunnel/{tunnel_id}",
             headers=_headers(api_token),
@@ -113,6 +115,10 @@ async def delete_tunnel(account_id: str, api_token: str, tunnel_id: str) -> bool
 
 CLOUDFLARED_INSTALL = """
 set -e
+umask 077
+cat > /root/.wgm-cf-token <<'CFTOKEN'
+{token}
+CFTOKEN
 # Install cloudflared binary if missing
 if ! command -v cloudflared &>/dev/null; then
   curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflare-main.gpg
@@ -129,7 +135,8 @@ if [ -f /etc/systemd/system/cloudflared.service ]; then
   systemctl daemon-reload
 fi
 
-cloudflared service install {token}
+cloudflared service install "$(cat /root/.wgm-cf-token)"
+rm -f /root/.wgm-cf-token
 systemctl enable cloudflared
 systemctl start cloudflared
 echo "CLOUDFLARED_OK"

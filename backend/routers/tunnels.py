@@ -1,25 +1,28 @@
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
+import base64
+import json
 from typing import Optional
-from database import get_db, CloudflareTunnel, CloudflareRoute, LXC, APICredential
-from auth import get_current_user
-import cloudflare as cf
-import proxmox_client as px
-import logger as log
 
-router = APIRouter(prefix="/api/tunnels", tags=["tunnels"])
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+import cloudflare as cf
+import logger as log
+import proxmox_local as host
+import validators as val
+from auth import get_current_user
+from database import APICredential, CloudflareRoute, CloudflareTunnel, LXC, SessionLocal, get_db
+
+router = APIRouter(prefix="/api/tunnels", tags=["tunnels"], dependencies=[Depends(get_current_user)])
 
 
 class TunnelCreate(BaseModel):
     name: str
-    account_id: Optional[str] = ""
-    api_token: Optional[str] = ""
     lxc_id: Optional[int] = None
-    mode: Optional[str] = "api"
+    mode: str = "api"                 # api | token
     existing_token: Optional[str] = ""
-    cred_id: Optional[int] = None        # ID from api_credentials table
+    cred_id: Optional[int] = None
 
 
 class RouteCreate(BaseModel):
@@ -28,238 +31,200 @@ class RouteCreate(BaseModel):
     description: Optional[str] = None
 
 
+def _serialize_route(r: CloudflareRoute) -> dict:
+    return {"id": r.id, "tunnel_id": r.tunnel_id, "public_url": r.public_url,
+            "service": r.service, "description": r.description}
+
+
+def _serialize(t: CloudflareTunnel) -> dict:
+    return {
+        "id": t.id, "name": t.name, "lxc_id": t.lxc_id, "tunnel_id": t.tunnel_id,
+        "account_id": t.account_id, "status": t.status, "managed": bool(t.api_token and t.account_id),
+        "lxc": {"vmid": t.lxc.vmid, "name": t.lxc.name} if t.lxc else None,
+        "routes": [_serialize_route(r) for r in t.routes],
+        "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
+    }
+
+
+def _get(tunnel_id: int, db: Session) -> CloudflareTunnel:
+    t = db.get(CloudflareTunnel, tunnel_id)
+    if not t:
+        raise HTTPException(404, "Túnel não encontrado")
+    return t
+
+
 @router.get("")
-def list_tunnels(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    return [_serialize_tunnel(t) for t in db.query(CloudflareTunnel).all()]
+def list_tunnels(db: Session = Depends(get_db)):
+    return [_serialize(t) for t in db.query(CloudflareTunnel).order_by(CloudflareTunnel.id).all()]
 
 
 @router.post("")
-async def create_tunnel(data: TunnelCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    token = ""
-    tunnel_id_str = ""
-
-    # Load credentials — from cred_id if provided, else first CF credential
-    account_id = data.account_id or ""
-    api_token_val = data.api_token or ""
-    if data.cred_id:
-        stored = db.query(APICredential).filter(APICredential.id == data.cred_id).first()
-    else:
-        stored = db.query(APICredential).filter(APICredential.provider == "cloudflare").first()
-    if stored and (not account_id or not api_token_val):
-        account_id = account_id or stored.account_id or ""
-        api_token_val = api_token_val or stored.api_token or ""
-        await log.emit("info", f"Usando credencial '{stored.name}'", "cf-tunnel")
-
+async def create_tunnel(data: TunnelCreate, db: Session = Depends(get_db)):
+    name = val.text(data.name, 60) or val.bad("Nome obrigatório")
+    lxc = db.get(LXC, data.lxc_id) if data.lxc_id else None
+    if data.lxc_id and not lxc:
+        raise HTTPException(404, "Container não encontrado")
+    account_id = api_token = ""
+    cred = None
     if data.mode == "token":
-        if not data.existing_token:
-            raise HTTPException(400, "Token é obrigatório no modo 'colar token'")
-        token = data.existing_token.strip()
+        token = (data.existing_token or "").strip()
+        if not token or len(token) > 4096:
+            val.bad("Cole o token do túnel (cloudflared service install <TOKEN>)")
         try:
-            import base64, json as _json
-            payload_b64 = token.split(".")[1]
-            payload_b64 += "=" * (4 - len(payload_b64) % 4)
-            payload = _json.loads(base64.b64decode(payload_b64))
-            tunnel_id_str = payload.get("t", "") or payload.get("tunnel_id", "") or "manual"
+            seg = token.split(".")[1] if "." in token else token
+            payload = json.loads(base64.b64decode(seg + "=" * (-len(seg) % 4)))
+            tunnel_id = payload.get("t") or payload.get("tunnel_id") or "manual"
         except Exception:
-            tunnel_id_str = "manual"
-        await log.emit("success", f"Tunnel '{data.name}' salvo com token existente", "cf-tunnel")
+            tunnel_id = "manual"
     else:
-        if not account_id or not api_token_val:
-            raise HTTPException(400, "Account ID e API Token são obrigatórios. Cadastre em Credenciais de API ou preencha o formulário.")
-        await log.emit("info", f"Criando tunnel '{data.name}' via CF API...", "cf-tunnel")
+        cred = db.get(APICredential, data.cred_id) if data.cred_id else \
+            db.query(APICredential).filter(APICredential.provider == "cloudflare").first()
+        if not cred or not cred.account_id:
+            raise HTTPException(400, "Cadastre uma credencial Cloudflare com Account ID em Credenciais")
+        account_id, api_token = cred.account_id, cred.api_token
+        await log.emit("info", f"Criando túnel '{name}' via API…", "cf-tunnel")
         try:
-            result = await cf.create_tunnel(account_id, api_token_val, data.name)
-            token = await cf.get_tunnel_token(account_id, api_token_val, result["tunnel_id"])
-            tunnel_id_str = result["tunnel_id"]
+            result = await cf.create_tunnel(account_id, api_token, name)
+            tunnel_id = result["tunnel_id"]
+            token = await cf.get_tunnel_token(account_id, api_token, tunnel_id)
         except Exception as e:
             await log.emit("error", str(e), "cf-tunnel")
-            raise HTTPException(500, str(e))
-        await log.emit("success", f"Tunnel '{data.name}' criado (ID: {tunnel_id_str})", "cf-tunnel")
-
-    tunnel = CloudflareTunnel(
-        name=data.name, lxc_id=data.lxc_id,
-        tunnel_id=tunnel_id_str, token=token,
-        account_id=account_id, api_token=api_token_val,
-        status="created",
-    )
-    db.add(tunnel)
+            raise HTTPException(502, str(e))
+    t = CloudflareTunnel(name=name, lxc_id=lxc.id if lxc else None, tunnel_id=tunnel_id, token=token,
+                         account_id=account_id, api_token=api_token, cred_id=cred.id if cred else None, status="created")
+    db.add(t)
     db.commit()
-    db.refresh(tunnel)
-
-    if data.lxc_id:
-        tid = tunnel.id
-        asyncio.get_event_loop().run_in_executor(None, lambda: _install_cloudflared(tid, data.lxc_id, token, db))
-
-    return _serialize_tunnel(tunnel)
+    db.refresh(t)
+    await log.emit("success", f"Túnel '{name}' salvo ({tunnel_id})", "cf-tunnel")
+    if lxc:
+        asyncio.get_running_loop().run_in_executor(None, _install_cloudflared, t.id)
+    return _serialize(t)
 
 
 @router.post("/{tunnel_id}/install")
-async def install_cloudflared(tunnel_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    tunnel = _get_tunnel_or_404(tunnel_id, db)
-    if not tunnel.lxc_id:
-        raise HTTPException(400, "No LXC associated")
-    await log.emit("info", f"Installing cloudflared on CT...", "cf-install")
-    asyncio.get_event_loop().run_in_executor(None, lambda: _install_cloudflared(tunnel_id, tunnel.lxc_id, tunnel.token, db))
+async def install(tunnel_id: int, db: Session = Depends(get_db)):
+    t = _get(tunnel_id, db)
+    if not t.lxc_id:
+        raise HTTPException(400, "Nenhum container associado")
+    asyncio.get_running_loop().run_in_executor(None, _install_cloudflared, t.id)
     return {"ok": True}
 
 
-def _install_cloudflared(tunnel_db_id: int, lxc_id: int, token: str, db: Session):
-    db2 = next(get_db())
+def _install_cloudflared(tunnel_db_id: int):
+    db = SessionLocal()
     try:
-        c = db2.query(LXC).filter(LXC.id == lxc_id).first()
-        if not c:
-            log.emit_sync("error", "LXC not found", "cf-install")
+        t = db.get(CloudflareTunnel, tunnel_db_id)
+        if not t or not t.lxc:
             return
-        script = cf.CLOUDFLARED_INSTALL.format(token=token)
-        for line in px.pct_exec_stream(c.vmid, script):
+        vmid = t.lxc.vmid
+        log.emit_sync("info", f"Instalando cloudflared no CT {vmid}…", "cf-install")
+        for line in host.pct_exec_stream(vmid, cf.CLOUDFLARED_INSTALL.format(token=t.token)):
             log.emit_sync("info", line, "cf-install")
-
-        t = db2.query(CloudflareTunnel).filter(CloudflareTunnel.id == tunnel_db_id).first()
-        if t:
-            t.status = "running"
-            db2.commit()
-        log.emit_sync("success", "cloudflared installed and running!", "cf-install")
+        t.status = "running"
+        db.commit()
+        log.emit_sync("success", f"cloudflared rodando no CT {vmid}", "cf-install")
     except Exception as e:
         log.emit_sync("error", str(e), "cf-install")
     finally:
-        db2.close()
+        db.close()
 
 
 @router.post("/{tunnel_id}/routes")
-async def add_route(tunnel_id: int, data: RouteCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    tunnel = _get_tunnel_or_404(tunnel_id, db)
-    route = CloudflareRoute(tunnel_id=tunnel_id, public_url=data.public_url, service=data.service, description=data.description)
+async def add_route(tunnel_id: int, data: RouteCreate, db: Session = Depends(get_db)):
+    t = _get(tunnel_id, db)
+    hostname = val.public_hostname(data.public_url.replace("https://", "").replace("http://", "").rstrip("/"))
+    service = val.tunnel_service(data.service)
+    if any(r.public_url == hostname for r in t.routes):
+        raise HTTPException(409, "Esse hostname já está neste túnel")
+    route = CloudflareRoute(tunnel_id=t.id, public_url=hostname, service=service, description=val.text(data.description))
     db.add(route)
     db.commit()
     db.refresh(route)
-
-    await log.emit("info", f"Configurando rota {data.public_url} → {data.service}...", "cf-route")
-    await _push_config(tunnel, db)
-
-    # Create DNS CNAME record if API credentials available
-    if tunnel.api_token and tunnel.account_id and tunnel.tunnel_id and tunnel.tunnel_id != "manual":
+    try:
+        await _push_config(t, db)
+    except Exception as e:
+        db.delete(route)
+        db.commit()
+        raise HTTPException(502, f"Falha ao atualizar o túnel: {e}")
+    dns = None
+    if t.api_token and t.tunnel_id not in ("", "manual"):
         try:
-            ok = await cf.create_dns_route(tunnel.account_id, tunnel.api_token, tunnel.tunnel_id, data.public_url)
-            if ok:
-                await log.emit("success", f"DNS CNAME criado: {data.public_url} → {tunnel.tunnel_id}.cfargotunnel.com", "cf-route")
-            else:
-                await log.emit("warn", f"Rota configurada mas DNS pode precisar de ajuste manual no CF", "cf-route")
+            dns = await cf.create_dns_route(t.account_id, t.api_token, t.tunnel_id, hostname)
         except Exception as e:
-            await log.emit("warn", f"Rota configurada localmente. DNS manual necessário: {e}", "cf-route")
-    else:
-        await log.emit("warn", f"Sem API token — adicione o CNAME manualmente no CF: {data.public_url} → <tunnel-id>.cfargotunnel.com (proxied)", "cf-route")
-
-    await log.emit("success", f"Rota {data.public_url} → {data.service} adicionada", "cf-route")
-    return _serialize_route(route)
+            await log.emit("warn", f"DNS não criado: {e}", "cf-route")
+    await log.emit("success", f"Rota {hostname} → {service}", "cf-route")
+    return {"route": _serialize_route(route), "dns": dns}
 
 
 @router.delete("/{tunnel_id}/routes/{route_id}")
-async def delete_route(tunnel_id: int, route_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+async def delete_route(tunnel_id: int, route_id: int, db: Session = Depends(get_db)):
+    t = _get(tunnel_id, db)
     route = db.query(CloudflareRoute).filter(CloudflareRoute.id == route_id, CloudflareRoute.tunnel_id == tunnel_id).first()
     if not route:
-        raise HTTPException(404, "Route not found")
+        raise HTTPException(404, "Rota não encontrada")
+    hostname = route.public_url
     db.delete(route)
     db.commit()
-    tunnel = _get_tunnel_or_404(tunnel_id, db)
-    await _push_config(tunnel, db)
+    db.refresh(t)
+    await _push_config(t, db)
+    if t.api_token and t.tunnel_id not in ("", "manual"):
+        try:
+            await cf.delete_dns_route(t.api_token, t.tunnel_id, hostname)
+        except Exception as e:
+            await log.emit("warn", f"CNAME de {hostname} não removido: {e}", "cf-route")
     return {"ok": True}
 
 
 @router.delete("/{tunnel_id}")
-async def delete_tunnel(tunnel_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    tunnel = _get_tunnel_or_404(tunnel_id, db)
-    try:
-        await cf.delete_tunnel(tunnel.account_id, tunnel.api_token, tunnel.tunnel_id)
-    except Exception:
-        pass
-    db.delete(tunnel)
+async def delete_tunnel(tunnel_id: int, db: Session = Depends(get_db)):
+    t = _get(tunnel_id, db)
+    if t.api_token and t.tunnel_id not in ("", "manual"):
+        for r in t.routes:
+            try:
+                await cf.delete_dns_route(t.api_token, t.tunnel_id, r.public_url)
+            except Exception:
+                pass
+        try:
+            await cf.delete_tunnel(t.account_id, t.api_token, t.tunnel_id)
+        except Exception as e:
+            await log.emit("warn", f"Túnel removido do painel, mas não da Cloudflare: {e}", "cf-tunnel")
+    if t.lxc:
+        vmid = t.lxc.vmid
+        asyncio.get_running_loop().run_in_executor(None, lambda: host.pct_exec(vmid, cf.CLOUDFLARED_UNINSTALL))
+    db.delete(t)
     db.commit()
     return {"ok": True}
 
 
 @router.get("/{tunnel_id}/status")
-async def tunnel_status(tunnel_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    tunnel = _get_tunnel_or_404(tunnel_id, db)
-    status = await cf.get_tunnel_status(tunnel.account_id, tunnel.api_token, tunnel.tunnel_id)
-    tunnel.status = status
+async def tunnel_status(tunnel_id: int, db: Session = Depends(get_db)):
+    t = _get(tunnel_id, db)
+    if not t.api_token:
+        return {"status": t.status}
+    t.status = await cf.get_tunnel_status(t.account_id, t.api_token, t.tunnel_id)
     db.commit()
-    return {"status": status}
+    return {"status": t.status}
 
 
-async def _push_config(tunnel: CloudflareTunnel, db: Session):
-    routes = db.query(CloudflareRoute).filter(CloudflareRoute.tunnel_id == tunnel.id).all()
-    route_list = [{"public_url": r.public_url, "service": r.service} for r in routes]
-
-    if tunnel.api_token and tunnel.account_id:
-        # Managed via CF API
-        await cf.update_tunnel_config(tunnel.account_id, tunnel.api_token, tunnel.tunnel_id, route_list)
-        await log.emit("success", f"Rotas atualizadas via CF API ({len(route_list)} rota(s))", "cf-route")
-    elif tunnel.lxc_id:
-        # No API token — write local config.yml to LXC and restart cloudflared
-        asyncio.get_event_loop().run_in_executor(
-            None, lambda: _push_local_config(tunnel.lxc_id, tunnel.tunnel_id, route_list)
-        )
-    else:
-        await log.emit("warn", "Sem API token e sem LXC — configure as rotas manualmente no dashboard CF", "cf-route")
-
-
-def _push_local_config(lxc_id: int, tunnel_id: str, routes: list):
-    """Write config.yml to LXC and restart cloudflared (used when no CF API token)."""
-    from database import SessionLocal
-    db2 = SessionLocal()
-    try:
-        c = db2.query(LXC).filter(LXC.id == lxc_id).first()
-        if not c:
-            log.emit_sync("error", "LXC not found for local config push", "cf-route")
-            return
-
-        ingress_lines = "\n".join(
-            f"  - hostname: {r['public_url']}\n    service: {r['service']}"
-            for r in routes
-        )
-        config_yml = f"""tunnel: {tunnel_id}
-ingress:
-{ingress_lines}
-  - service: http_status:404
-"""
+async def _push_config(t: CloudflareTunnel, db: Session):
+    routes = [{"public_url": r.public_url, "service": r.service} for r in t.routes]
+    if t.api_token and t.account_id:
+        await cf.update_tunnel_config(t.account_id, t.api_token, t.tunnel_id, routes)
+        await log.emit("success", f"Ingress atualizado via API ({len(routes)} rota(s))", "cf-route")
+    elif t.lxc:
+        vmid, tid = t.lxc.vmid, t.tunnel_id
+        ingress = "\n".join(f"  - hostname: {r['public_url']}\n    service: {r['service']}" for r in routes)
         script = f"""mkdir -p /etc/cloudflared
-cat > /etc/cloudflared/config.yml << 'CFEOF'
-{config_yml}
+cat > /etc/cloudflared/config.yml <<'CFEOF'
+tunnel: {tid}
+ingress:
+{ingress}
+  - service: http_status:404
 CFEOF
-systemctl restart cloudflared
-echo "CONFIG_APPLIED"
+systemctl restart cloudflared && echo CONFIG_APPLIED
 """
-        code, out = px.pct_exec(c.vmid, script)
-        if "CONFIG_APPLIED" in out:
-            log.emit_sync("success", f"config.yml atualizado na LXC com {len(routes)} rota(s), cloudflared reiniciado", "cf-route")
-        else:
-            log.emit_sync("warn", f"config.yml escrito mas cloudflared pode não ter reiniciado: {out[:200]}", "cf-route")
-    except Exception as e:
-        log.emit_sync("error", str(e), "cf-route")
-    finally:
-        db2.close()
-
-
-def _get_tunnel_or_404(tunnel_id: int, db: Session) -> CloudflareTunnel:
-    t = db.query(CloudflareTunnel).filter(CloudflareTunnel.id == tunnel_id).first()
-    if not t:
-        raise HTTPException(404, "Tunnel not found")
-    return t
-
-
-def _serialize_tunnel(t: CloudflareTunnel) -> dict:
-    return {
-        "id": t.id, "name": t.name, "lxc_id": t.lxc_id,
-        "tunnel_id": t.tunnel_id, "account_id": t.account_id,
-        "status": t.status,
-        "routes": [_serialize_route(r) for r in t.routes],
-        "created_at": t.created_at.isoformat() if t.created_at else None,
-    }
-
-
-def _serialize_route(r: CloudflareRoute) -> dict:
-    return {
-        "id": r.id, "tunnel_id": r.tunnel_id,
-        "public_url": r.public_url, "service": r.service,
-        "description": r.description,
-    }
+        _, out = await asyncio.get_running_loop().run_in_executor(None, host.pct_exec, vmid, script)
+        if "CONFIG_APPLIED" not in out:
+            raise Exception(out.strip()[-200:] or "cloudflared não reiniciou")
+    else:
+        await log.emit("warn", "Túnel sem API e sem container — configure as rotas no painel da Cloudflare", "cf-route")

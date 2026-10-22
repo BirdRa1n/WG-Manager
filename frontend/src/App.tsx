@@ -1,48 +1,53 @@
-import { useState, useEffect } from 'react'
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { Loader2 } from 'lucide-react'
+import { api } from './api/client'
+import { FeedbackProvider } from './ui'
+import { ActivityProvider } from './activity'
+import Layout from './Layout'
 import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
-import VPSPage from './pages/VPSPage'
-import LXCPage from './pages/LXCPage'
-import PortRules from './pages/PortRules'
-import SimpleForwarding from './pages/SimpleForwarding'
-import CloudflareTunnels from './pages/CloudflareTunnels'
-import LogsPage from './pages/LogsPage'
-import CredentialsPage from './pages/CredentialsPage'
-import Sidebar from './components/Sidebar'
-import LogTerminal from './components/LogTerminal'
+import Forwards from './pages/Forwards'
+import Servers from './pages/Servers'
+import Guests from './pages/Guests'
+import Tunnels from './pages/Tunnels'
+import Credentials from './pages/Credentials'
+import Activity from './pages/Activity'
 
 export default function App() {
-  const [authed, setAuthed] = useState(!!localStorage.getItem('token'))
+  const [user, setUser] = useState<string | null | undefined>(undefined)
 
-  function logout() {
-    localStorage.clear()
-    setAuthed(false)
-  }
+  useEffect(() => {
+    api.me().then(r => setUser(r.username)).catch(() => setUser(null))
+    const onUnauthorized = () => setUser(null)
+    window.addEventListener('wgm:unauthorized', onUnauthorized)
+    return () => window.removeEventListener('wgm:unauthorized', onUnauthorized)
+  }, [])
 
-  if (!authed) {
-    return <Login onLogin={() => setAuthed(true)} />
+  if (user === undefined) {
+    return <div style={{ height: '100%', display: 'grid', placeItems: 'center' }}><Loader2 className="spin" style={{ animation: 'spin 0.8s linear infinite', color: 'var(--muted)' }} /></div>
   }
 
   return (
-    <BrowserRouter>
-      <div style={{ display: 'flex', background: '#070d1a', minHeight: '100vh', color: '#e8f0ff' }}>
-        <Sidebar onLogout={logout} />
-        <main style={{ marginLeft: 232, flex: 1, padding: '28px 32px', paddingBottom: 220 }}>
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/vps" element={<VPSPage />} />
-            <Route path="/lxc" element={<LXCPage />} />
-            <Route path="/ports" element={<PortRules />} />
-            <Route path="/simple" element={<SimpleForwarding />} />
-            <Route path="/cloudflare" element={<CloudflareTunnels />} />
-            <Route path="/credentials" element={<CredentialsPage />} />
-            <Route path="/logs" element={<LogsPage />} />
-            <Route path="*" element={<Navigate to="/" />} />
-          </Routes>
-        </main>
-        <LogTerminal />
-      </div>
-    </BrowserRouter>
+    <FeedbackProvider>
+      {!user ? <Login onLogin={setUser} /> : (
+        <ActivityProvider>
+          <BrowserRouter>
+            <Routes>
+              <Route element={<Layout user={user} onLogout={() => api.logout().finally(() => setUser(null))} />}>
+                <Route index element={<Dashboard />} />
+                <Route path="forwards" element={<Forwards />} />
+                <Route path="servers" element={<Servers />} />
+                <Route path="guests" element={<Guests />} />
+                <Route path="tunnels" element={<Tunnels />} />
+                <Route path="credentials" element={<Credentials />} />
+                <Route path="activity" element={<Activity />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Route>
+            </Routes>
+          </BrowserRouter>
+        </ActivityProvider>
+      )}
+    </FeedbackProvider>
   )
 }

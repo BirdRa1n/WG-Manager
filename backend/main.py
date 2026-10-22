@@ -1,53 +1,82 @@
+import asyncio
+import json
 import os
 import sys
+
 sys.path.insert(0, os.path.dirname(__file__))
+os.umask(0o077)
 
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+import config
+import logger as log
+from auth import authenticate_proxmox, clear_session_cookie, create_token, get_current_user, set_session_cookie
 from database import init_db
-from auth import authenticate_proxmox, create_token, get_current_user
-from routers import vps, lxc, ports, tunnels, events, credentials, stats
+from routers import credentials, events, forwards, lxc, stats, system, tunnels, vps
 
-app = FastAPI(title="WG Proxy Manager", version="1.0.0")
+VERSION_FILE = os.path.join(config.BASE_DIR, "version.json")
+STATIC_DIR = os.path.join(config.BASE_DIR, "frontend", "dist")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-app.include_router(vps.router)
-app.include_router(lxc.router)
-app.include_router(ports.router)
-app.include_router(tunnels.router)
-app.include_router(events.router)
-app.include_router(credentials.router)
-app.include_router(stats.router)
+def _version() -> str:
+    try:
+        with open(VERSION_FILE) as f:
+            return json.load(f).get("version", "unknown")
+    except Exception:
+        return "unknown"
 
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+
+app = FastAPI(title="WG Manager", version=_version(), docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.middleware("http")
+async def security(request: Request, call_next):
+    # CSRF: state-changing API calls must carry a header that cross-site forms cannot set.
+    if request.url.path.startswith("/api/") and request.method not in ("GET", "HEAD", "OPTIONS"):
+        if request.headers.get("x-wgm") != "1":
+            return JSONResponse({"detail": "Requisição recusada (CSRF)"}, status_code=403)
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self' https://api.github.com; frame-ancestors 'none'"
+    )
+    return response
+
+
+for r in (vps, lxc, forwards, tunnels, events, credentials, stats, system):
+    app.include_router(r.router)
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
 
 
 @app.post("/api/auth/login")
-def login(req: LoginRequest):
-    data = authenticate_proxmox(req.username, req.password)
-    token = create_token(req.username)
-    return {"token": token, "username": req.username, "proxmox_ticket": data["ticket"], "proxmox_csrf": data["csrf"]}
+def login(req: LoginRequest, request: Request):
+    user = authenticate_proxmox(req.username.strip(), req.password, request.client.host if request.client else "?")
+    resp = JSONResponse({"username": user})
+    set_session_cookie(resp, create_token(user))
+    log.emit_sync("info", f"Login de {user}", "auth")
+    return resp
+
+
+@app.post("/api/auth/logout")
+def logout():
+    resp = JSONResponse({"ok": True})
+    clear_session_cookie(resp)
+    return resp
 
 
 @app.get("/api/auth/me")
 def me(user: str = Depends(get_current_user)):
-    return {"username": user}
+    return {"username": user, "dev_auth": config.DEV_AUTH}
 
 
 @app.get("/api/health")
@@ -57,37 +86,37 @@ def health():
 
 @app.get("/api/version")
 def version():
-    import json
-    version_file = os.path.join(os.path.dirname(__file__), "..", "version.json")
-    try:
-        with open(version_file) as f:
-            data = json.load(f)
-        return {"version": data.get("version", "unknown")}
-    except Exception:
-        return {"version": "unknown"}
+    return {"version": _version()}
 
 
-# Serve React frontend
-if os.path.exists(STATIC_DIR):
+@app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+def api_not_found(rest: str):
+    return JSONResponse({"detail": "Rota não encontrada"}, status_code=404)
+
+
+if os.path.isdir(STATIC_DIR):
     app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
 
     @app.get("/{full_path:path}")
     def serve_frontend(full_path: str):
+        candidate = os.path.realpath(os.path.join(STATIC_DIR, full_path))
+        if full_path and candidate.startswith(os.path.realpath(STATIC_DIR) + os.sep) and os.path.isfile(candidate):
+            return FileResponse(candidate)
         return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
 @app.on_event("startup")
 async def startup():
-    import asyncio
-    import logger as log
-    from routers.stats import start_collector
-    loop = asyncio.get_event_loop()
-    log.set_loop(loop)
+    log.set_loop(asyncio.get_running_loop())
+    config.harden_permissions()
     init_db()
-    asyncio.create_task(start_collector(None))
-    print(f"WG Proxy Manager started on port {os.getenv('PANEL_PORT', '8765')}")
+    config.harden_permissions()
+    asyncio.create_task(stats.start_collector())
+    if config.DEV_AUTH:
+        print("!! WGM_DEV_AUTH=1 — login sem senha habilitado. Nunca use em produção.")
+    print(f"WG Manager {_version()} em {config.PANEL_HOST}:{config.PANEL_PORT}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PANEL_PORT", "8765")), reload=False)
+    uvicorn.run("main:app", host=config.PANEL_HOST, port=config.PANEL_PORT, reload=False, proxy_headers=False)
