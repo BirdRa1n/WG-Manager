@@ -8,6 +8,7 @@ import Layout from './Layout'
 import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Forwards from './pages/Forwards'
+import Sites from './pages/Sites'
 import Servers from './pages/Servers'
 import Guests from './pages/Guests'
 import Tunnels from './pages/Tunnels'
@@ -37,6 +38,7 @@ export default function App() {
               <Route element={<Layout user={user} onLogout={() => api.logout().finally(() => setUser(null))} />}>
                 <Route index element={<Dashboard />} />
                 <Route path="forwards" element={<Forwards />} />
+                <Route path="sites" element={<Sites />} />
                 <Route path="servers" element={<Servers />} />
                 <Route path="guests" element={<Guests />} />
                 <Route path="tunnels" element={<Tunnels />} />

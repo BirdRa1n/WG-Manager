@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import {
-  Activity as ActivityIc, ArrowLeftRight, Bell, Boxes, ChevronRight, Cloud, KeyRound, LayoutDashboard,
+  Activity as ActivityIc, ArrowLeftRight, Bell, Boxes, ChevronRight, Cloud, Globe, KeyRound, LayoutDashboard,
   LogOut, Menu, Moon, Server, Sun,
 } from 'lucide-react'
 import { api } from './api/client'
@@ -13,6 +13,7 @@ const NAV = [
   { section: 'Visão geral', items: [{ to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true }] },
   { section: 'Rede', items: [
     { to: '/forwards', label: 'Encaminhamentos', icon: ArrowLeftRight },
+    { to: '/sites', label: 'Sites', icon: Globe },
     { to: '/servers', label: 'Servidores', icon: Server },
     { to: '/guests', label: 'Containers & VMs', icon: Boxes },
   ] },

@@ -69,6 +69,18 @@ export interface Overview {
   counts: { forwards: number; containers_wg: number }
 }
 
+export interface Site {
+  id: number; hostname: string; upstream_scheme: 'http' | 'https'; upstream_ip: string; upstream_port: number
+  vmid: number | null; tls: boolean; enabled: boolean; description: string
+  dns?: 'ok' | 'other' | 'missing'; dns_ips?: string[]
+}
+export interface ProxyInfo {
+  id: number; vps_id: number; vps_name: string; vps_host: string; lxc_id: number; vmid: number; lxc_name: string
+  proxy_ip: string; acme_email: string | null; status: 'pending' | 'installing' | 'ready' | 'error'
+  forwards: { id: number; port: number; enabled: boolean; target_ip: string }[]
+  caddy?: { installed: boolean; active: boolean; version?: string; error?: string }
+}
+
 export interface LogEntry { ts: string; level: string; message: string; operation: string }
 
 // ── Transport ────────────────────────────────────────────────────────────────────────────
@@ -154,6 +166,17 @@ export const api = {
   createCredential: (data: any) => req<Credential>('POST', '/credentials', data),
   verifyCredential: (id: number) => req<any>('POST', `/credentials/${id}/verify`),
   deleteCredential: (id: number) => req<any>('DELETE', `/credentials/${id}`),
+
+  proxy: () => req<ProxyInfo | null>('GET', '/sites/proxy'),
+  setupProxy: (data: { vps_id: number; vmid: number; acme_email: string }) => req<ProxyInfo>('POST', '/sites/proxy', data),
+  reinstallProxy: () => req<any>('POST', '/sites/proxy/reinstall'),
+  proxyLogs: () => req<{ logs: string }>('GET', '/sites/proxy/logs'),
+  applySites: () => req<{ ok: boolean; message: string }>('POST', '/sites/apply'),
+  listSites: () => req<Site[]>('GET', '/sites'),
+  createSite: (data: Partial<Site>) => req<{ site: Site; apply: { ok: boolean; message: string } }>('POST', '/sites', data),
+  updateSite: (id: number, data: Partial<Site>) => req<{ site: Site; apply: { ok: boolean; message: string } }>('PUT', `/sites/${id}`, data),
+  toggleSite: (id: number) => req<{ site: Site; apply: { ok: boolean; message: string } }>('PATCH', `/sites/${id}/toggle`),
+  deleteSite: (id: number) => req<{ ok: boolean; apply: { ok: boolean; message: string } }>('DELETE', `/sites/${id}`),
 
   logHistory: () => req<LogEntry[]>('GET', '/events/history'),
 }
