@@ -1,98 +1,162 @@
-const BASE = '/api'
+// ── Types ────────────────────────────────────────────────────────────────────────────────
+export type Protocol = 'tcp' | 'udp' | 'both'
+export type Mode = 'host' | 'direct'
 
-function getToken() {
-  return localStorage.getItem('token') || ''
+export interface VPS {
+  id: number; name: string; host: string; ssh_port: number; ssh_user: string; ssh_host_key: string
+  wg_public_key: string | null; wg_address: string | null; wg_listen_port: number; wg_interface: string
+  pub_interface: string; gw_ip: string | null; gw_iface: string | null; lan_iface: string | null
+  status: string; last_error: string | null; last_seen: string | null; created_at: string; rules: number
 }
 
-function headers(extra: Record<string, string> = {}) {
-  return { 'Content-Type': 'application/json', Authorization: `Bearer ${getToken()}`, ...extra }
+export interface Forward {
+  id: number; vps_id: number; lxc_id: number | null; vmid: number | null; port: number; protocol: Protocol
+  mode: Mode; target_ip: string; target_port: number; description: string; enabled: boolean
+  source: 'panel' | 'imported'; created_at: string; updated_at: string
+}
+
+export interface ApplyResult { ok: boolean; [target: string]: any }
+
+export type HopStatus = 'applied' | 'missing' | 'partial' | 'disabled' | 'n/a'
+export interface TargetState {
+  name: string; available: boolean; error?: string; installed?: boolean; hooked?: boolean
+  stray?: number[]; listening?: { tcp: number[]; udp: number[] }; legacy_count?: number; ip_forward?: string
+}
+export interface ForwardStatus { targets: Record<string, TargetState>; rules: Record<string, { vps?: HopStatus; host?: HopStatus }> }
+
+export interface LegacyItem {
+  protocol: Protocol; port: number; mode: Mode; target_ip: string | null; target_port: number
+  vps_spec: string[]; host_spec: string[]; status: 'complete' | 'vps_only' | 'host_only'
+  port_in_use: boolean; exists: boolean
+}
+
+export interface Guest {
+  vmid: number; name: string; type: 'lxc' | 'qemu'; node: string; status: string
+  cpus: number; maxmem: number; mem: number; uptime: number; tags: string
+  ips: { ip: string; iface: string }[]; managed: ManagedLXC | null; forwards: number
+}
+export interface ManagedLXC {
+  id: number; vmid: number; name: string; proxmox_node: string; wg_public_key: string | null
+  wg_address: string | null; wg_vps_id: number | null; status: string
+}
+
+export interface Peer {
+  pubkey: string; endpoint: string | null; allowed_ips: string | null; last_handshake: number
+  rx_bytes: number; tx_bytes: number; keepalive: string | null; label: string | null
+  kind: 'host' | 'lxc' | 'unknown'; lxc_id: number | null; orphan: boolean
+}
+
+export interface Tunnel {
+  id: number; name: string; lxc_id: number | null; tunnel_id: string; account_id: string; status: string
+  managed: boolean; lxc: { vmid: number; name: string } | null
+  routes: { id: number; public_url: string; service: string; description: string | null }[]
+}
+
+export interface Credential {
+  id: number; name: string; provider: string; account_id: string; api_token_preview: string
+  permissions: string[]; permission_labels: string[]; notes: string; created_at: string
+}
+
+export interface Alert { level: 'error' | 'warn' | 'info'; title: string; detail?: string; link?: string | null }
+export interface Overview {
+  host: { name: string; wg: { name: string; address: string; peers: number }[]; on_proxmox: boolean }
+  vps: {
+    id: number; name: string; host: string; wg_address: string | null; online: boolean | undefined
+    latency_ms?: number; error?: string; peers: number; gw_ip: string | null; gw_iface: string | null
+    gw_handshake_age: number | null; rules_host: number; rules_direct: number
+  }[]
+  alerts: Alert[]
+  counts: { forwards: number; containers_wg: number }
+}
+
+export interface LogEntry { ts: string; level: string; message: string; operation: string }
+
+// ── Transport ────────────────────────────────────────────────────────────────────────────
+export class ApiError extends Error {
+  constructor(public status: number, message: string) { super(message) }
 }
 
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const isForm = body instanceof FormData
+  const res = await fetch(`/api${path}`, {
     method,
-    headers: body instanceof FormData ? { Authorization: `Bearer ${getToken()}` } : headers(),
-    body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
+    credentials: 'same-origin',
+    headers: {
+      'X-WGM': '1',
+      ...(body !== undefined && !isForm ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: isForm ? body : body !== undefined ? JSON.stringify(body) : undefined,
   })
+  if (res.status === 401 && path !== '/auth/login' && path !== '/auth/me') {
+    window.dispatchEvent(new Event('wgm:unauthorized'))
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(err.detail || 'Request failed')
+    const detail = Array.isArray(err.detail) ? err.detail.map((d: any) => d.msg).join('; ') : err.detail
+    throw new ApiError(res.status, detail || `Erro ${res.status}`)
   }
   return res.json()
 }
 
 export const api = {
-  login: (username: string, password: string) =>
-    req<{ token: string; username: string; proxmox_ticket: string; proxmox_csrf: string }>(
-      'POST', '/auth/login', { username, password }
-    ),
-  me: () => req<{ username: string }>('GET', '/auth/me'),
+  login: (username: string, password: string) => req<{ username: string }>('POST', '/auth/login', { username, password }),
+  logout: () => req<{ ok: boolean }>('POST', '/auth/logout'),
+  me: () => req<{ username: string; dev_auth: boolean }>('GET', '/auth/me'),
+  version: () => req<{ version: string }>('GET', '/version'),
 
-  // VPS
-  listVPS: () => req<any[]>('GET', '/vps'),
-  createVPS: (form: FormData) => req<any>('POST', '/vps', form),
-  testVPS: (id: number) => req<{ ok: boolean }>('POST', `/vps/${id}/test`),
+  overview: () => req<Overview>('GET', '/system/overview'),
+  summary: () => req<any>('GET', '/stats/summary'),
+  traffic: () => req<{ ts: string; rx: number; tx: number }[]>('GET', '/stats/traffic'),
+  statsWG: (vpsId: number) => req<any[]>('GET', `/stats/wg/${vpsId}`),
+
+  listVPS: () => req<VPS[]>('GET', '/vps'),
+  createVPS: (form: FormData) => req<VPS>('POST', '/vps', form),
+  updateVPS: (id: number, data: Partial<VPS>) => req<VPS>('PATCH', `/vps/${id}`, data),
+  testVPS: (id: number) => req<{ ok: boolean; root?: boolean; error?: string; host_key?: string }>('POST', `/vps/${id}/test`),
+  detectVPS: (id: number) => req<any>('POST', `/vps/${id}/detect`),
   installWGVPS: (id: number) => req<any>('POST', `/vps/${id}/install-wireguard`),
-  detectWGVPS: (id: number) => req<any>('POST', `/vps/${id}/detect-wireguard`),
+  resetHostKey: (id: number) => req<VPS>('POST', `/vps/${id}/reset-host-key`),
+  peers: (id: number) => req<Peer[]>('GET', `/vps/${id}/peers`),
+  removePeer: (id: number, pubkey: string) => req<any>('POST', `/vps/${id}/peers/remove`, { pubkey }),
   deleteVPS: (id: number) => req<any>('DELETE', `/vps/${id}`),
-  wgStatusVPS: (id: number) => req<{ output: string }>('GET', `/vps/${id}/wg-status`),
-  wgPeers: (id: number) => req<any[]>('GET', `/vps/${id}/wg-peers`),
 
-  // LXC
-  listProxmoxLXC: (ticket: string, node = 'pve') =>
-    req<any[]>('GET', `/lxc/proxmox-list?ticket=${encodeURIComponent(ticket)}&node=${node}`),
-  listLXC: () => req<any[]>('GET', '/lxc'),
-  importLXC: (data: any) => req<any>('POST', '/lxc', data),
-  checkPermissions: (id: number) => req<any>('POST', `/lxc/${id}/check-permissions`),
-  fixPermissions: (id: number, ticket: string, csrf: string) =>
-    req<any>('POST', `/lxc/${id}/fix-permissions?ticket=${encodeURIComponent(ticket)}&csrf=${encodeURIComponent(csrf)}`),
-  installWGLXC: (id: number, vpsId: number, mode: string) =>
-    req<any>('POST', `/lxc/${id}/install-wireguard?vps_id=${vpsId}&mode=${mode}`),
-  checkWGExisting: (id: number) =>
-    req<{ installed: boolean; running: boolean; config_exists: boolean; peer: string; config_preview: string }>('GET', `/lxc/${id}/check-wg-existing`),
+  listForwards: () => req<Forward[]>('GET', '/forwards'),
+  forwardStatus: () => req<ForwardStatus>('GET', '/forwards/status'),
+  createForward: (data: Partial<Forward>) => req<{ rule: Forward; apply: ApplyResult }>('POST', '/forwards', data),
+  updateForward: (id: number, data: Partial<Forward>) => req<{ rule: Forward; apply: ApplyResult }>('PUT', `/forwards/${id}`, data),
+  toggleForward: (id: number) => req<{ rule: Forward; apply: ApplyResult }>('PATCH', `/forwards/${id}/toggle`),
+  deleteForward: (id: number) => req<{ ok: boolean; apply: ApplyResult }>('DELETE', `/forwards/${id}`),
+  applyAll: () => req<ApplyResult>('POST', '/forwards/apply'),
+  legacy: (vpsId: number) => req<{ items: LegacyItem[]; gw_ip: string | null; host_available: boolean; host_error?: string }>('GET', `/forwards/legacy/${vpsId}`),
+  importLegacy: (vpsId: number, items: any[]) => req<{ imported: number; apply: ApplyResult }>('POST', `/forwards/legacy/${vpsId}/import`, items),
+  cleanupLegacy: (vpsId: number, data: { vps_spec: string[]; host_spec: string[] }) => req<any>('POST', `/forwards/legacy/${vpsId}/cleanup`, data),
+
+  guests: (refresh = false) => req<Guest[]>('GET', `/lxc/guests${refresh ? '?refresh=true' : ''}`),
+  listLXC: () => req<ManagedLXC[]>('GET', '/lxc'),
+  importLXC: (data: { vmid: number; name: string; proxmox_node: string }) => req<ManagedLXC>('POST', '/lxc', data),
+  checkWG: (id: number) => req<any>('GET', `/lxc/${id}/check-wg`),
+  checkPermissions: (id: number) => req<{ ok: boolean; issues: { key: string; message: string; fixable: boolean }[] }>('POST', `/lxc/${id}/check-permissions`),
+  fixPermissions: (id: number) => req<{ ok: boolean; output: string; restart_required: boolean }>('POST', `/lxc/${id}/fix-permissions`),
+  installWGLXC: (id: number, vps_id: number, full_tunnel: boolean) => req<any>('POST', `/lxc/${id}/install-wireguard`, { vps_id, full_tunnel }),
   removeWGLXC: (id: number) => req<any>('POST', `/lxc/${id}/remove-wireguard`),
-  deleteLXC: (id: number) => req<any>('DELETE', `/lxc/${id}`),
+  deleteLXC: (id: number, forget = false) => req<any>('DELETE', `/lxc/${id}${forget ? '?forget=true' : ''}`),
 
-  // Ports
-  listPorts: () => req<any[]>('GET', '/ports'),
-  createPort: (data: any) => req<any>('POST', '/ports', data),
-  deletePort: (id: number) => req<any>('DELETE', `/ports/${id}`),
-  updatePort: (id: number, data: any) => req<any>('PUT', `/ports/${id}`, data),
-  togglePort: (id: number) => req<any>('PATCH', `/ports/${id}/toggle`),
-  syncFromVPS: (vpsId: number) =>
-    req<{ live_rules: any[]; missing_in_db: any[]; missing_on_vps: any[]; raw_output: string }>(
-      'GET', `/ports/sync/${vpsId}`
-    ),
-  importFromVPS: (vpsId: number, rules: any[]) => req<any>('POST', `/ports/import/${vpsId}`, rules),
-  applyMissingToVPS: (vpsId: number, rules: any[]) => req<any>('POST', `/ports/apply-missing/${vpsId}`, rules),
-
-  // Cloudflare Tunnels
-  listTunnels: () => req<any[]>('GET', '/tunnels'),
-  createTunnel: (data: any) => req<any>('POST', '/tunnels', data),
-  addRoute: (tunnelId: number, data: any) => req<any>('POST', `/tunnels/${tunnelId}/routes`, data),
-  deleteRoute: (tunnelId: number, routeId: number) => req<any>('DELETE', `/tunnels/${tunnelId}/routes/${routeId}`),
+  listTunnels: () => req<Tunnel[]>('GET', '/tunnels'),
+  createTunnel: (data: any) => req<Tunnel>('POST', '/tunnels', data),
+  addRoute: (id: number, data: any) => req<any>('POST', `/tunnels/${id}/routes`, data),
+  deleteRoute: (id: number, routeId: number) => req<any>('DELETE', `/tunnels/${id}/routes/${routeId}`),
   deleteTunnel: (id: number) => req<any>('DELETE', `/tunnels/${id}`),
   tunnelStatus: (id: number) => req<{ status: string }>('GET', `/tunnels/${id}/status`),
   installCloudflared: (id: number) => req<any>('POST', `/tunnels/${id}/install`),
 
-  // Credentials
-  listCredentials: () => req<any[]>('GET', '/credentials'),
-  createCredential: (data: any) => req<any>('POST', '/credentials', data),
+  listCredentials: () => req<Credential[]>('GET', '/credentials'),
+  createCredential: (data: any) => req<Credential>('POST', '/credentials', data),
   verifyCredential: (id: number) => req<any>('POST', `/credentials/${id}/verify`),
   deleteCredential: (id: number) => req<any>('DELETE', `/credentials/${id}`),
-  getActiveCFCredential: () => req<any>('GET', '/credentials/cloudflare/active'),
 
-  // Version
-  getVersion: () => req<{ version: string }>('GET', '/version'),
-
-  // Stats
-  statsSummary: () => req<any>('GET', '/stats/summary'),
-  statsWG: (vpsId: number) => req<any[]>('GET', `/stats/wg/${vpsId}`),
-
-  // Logs
-  logHistory: () => req<any[]>('GET', '/events/history'),
+  logHistory: () => req<LogEntry[]>('GET', '/events/history'),
 }
 
-export function createEventSource(): EventSource {
-  return new EventSource(`${BASE}/events/stream?token=${getToken()}`)
+export function eventStream(): EventSource {
+  return new EventSource('/api/events/stream', { withCredentials: true })
 }
